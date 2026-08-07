@@ -13,6 +13,8 @@ $$;
 
 GRANT CONNECT ON DATABASE credit_rdbms_db TO rag_readonly;
 
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO  rag_readonly;
+
 
 
 -- Execute the following command also in PSQL Tool 

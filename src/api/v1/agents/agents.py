@@ -260,6 +260,10 @@ def nl2sql_node(state: RAGState) -> RAGState:
     # response["sql_query_executed"] = generated_sql
     # # return the sql query is RAGState
     # # and also the output in sql_result of RAGState
+    print("========= NL2SQL NODE OUTPUT =========")
+    print("\nSQL Result:")
+    print(str(sql_result))
+    print("======================================")
     return {
         **state,
         "generated_sql": generated_sql,
