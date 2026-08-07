@@ -1,6 +1,17 @@
-def main():
-    print("Hello from credit-card-spend-summarization!")
+from fastapi import FastAPI
+from src.api.v1.routes import query
+
+app = FastAPI()
 
 
-if __name__ == "__main__":
-    main()
+@app.get("/")
+async def root():
+    return {"message": "Hello from credit-card-spend-summarization!"}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+app.include_router(query.router)
