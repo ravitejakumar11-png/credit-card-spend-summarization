@@ -1,10 +1,13 @@
 from typing import TypedDict, List
 from langchain_core.documents import Document
-from pydantic import BaseModel
+from langchain_core.messages import BaseMessage
+
+# from pydantic import BaseModel
 
 
 # state for the agent
 class RAGState(TypedDict):
+    messages: list[BaseMessage]
     query: str
     retrieved_docs: List[Document]
     reranked_docs: List[Document]
@@ -16,5 +19,5 @@ class RAGState(TypedDict):
     sql_context: str
     final_context: str
     evaluation: str
-    retry_count: int    
+    evaluate_count: int
     evaluation_feedback: str

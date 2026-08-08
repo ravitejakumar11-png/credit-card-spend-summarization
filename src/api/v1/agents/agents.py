@@ -12,6 +12,7 @@ from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 from typing import Literal
+from langgraph.checkpoint.memory import InMemorySaver
 from src.api.v1.states.rag_state import RAGState
 from src.api.v1.tools.vector_search_tool import vector_search_node
 from src.api.v1.schemas.query_schema import AIResponse
@@ -145,17 +146,24 @@ reason
             (
                 "human",
                 """
-User Question:
+    Conversation History:
 
-{query}
-""",
+    {history}
+
+
+    Current User Question:
+
+    {query}
+    """,
             ),
         ]
     )
 
     chain = prompt | structured_llm
 
-    decision = chain.invoke({"query": state["query"]})
+    decision = chain.invoke(
+        {"query": state["query"], "history": state.get("messages", [])}
+    )
 
     print(f"[router_node] Route : {decision.route}")
     print(f"[router_node] Reason: {decision.reason}")
@@ -180,8 +188,70 @@ def nl2sql_node(state: RAGState) -> RAGState:
             (
                 "system",
                 """
-                   You are a PostgreSQL expert. Given the database schema below,
-                   write a single valid SELECT query that answers the user's question.
+                   You are an expert SQL generator for a conversational database assistant.
+
+Your task is to generate accurate PostgreSQL queries based on:
+
+1. The current user question
+2. Previous conversation history
+3. Available database schema and business rules
+
+
+## Conversation Context Resolution Rules
+
+The user may ask follow-up questions that depend on information mentioned earlier in the conversation.
+
+The current question may contain references such as:
+
+- he / she / they
+- this customer
+- this account
+- this card
+- this transaction
+- the same one
+- the previous one
+- that record
+
+Before generating SQL, you MUST resolve these references using the conversation history.
+
+
+## Entity Resolution Guidelines
+
+- Identify any relevant entities already established in the conversation.
+- Maintain continuity with previously identified entities.
+- If a previous turn established a specific entity, use that entity when generating SQL.
+- Do not broaden the query unnecessarily when the context already identifies the target entity.
+
+Examples of incorrect behavior:
+
+- Returning data for all entities when the conversation context identifies a specific one.
+- Ignoring previously established identifiers.
+- Asking for clarification when the entity can be resolved from conversation history.
+
+
+## SQL Generation Rules
+
+Before generating the final SQL:
+
+1. Understand the user's intent.
+2. Resolve any ambiguous references using conversation history.
+3. Identify the required tables and relationships.
+4. Apply appropriate filters based on the resolved context.
+5. Generate only the SQL required to answer the user's question.
+
+
+## Validation Before Returning SQL
+
+Check:
+
+- Does the query answer the current user question?
+- Did I correctly resolve any references from previous conversation?
+- Am I querying a broader dataset than required?
+- Are required filtering conditions present?
+- Is the SQL syntactically valid PostgreSQL?
+
+
+If the conversation provides enough context to identify the target entity, the generated SQL should reflect that context.
 
 
                    Rules:
@@ -206,16 +276,24 @@ def nl2sql_node(state: RAGState) -> RAGState:
             (
                 "human",
                 """
-                   Question:
-                   {question}
-               """,
+                  
+                Conversation History:
+
+                {history}
+
+                Current User Question:
+                {question}
+                            """,
             ),
         ]
     )
     # preprare the chain and invoke with a query
     sql_chain = sql_prompt | llm
     # look for sql query only
-    raw_sql = sql_chain.invoke({"schema": schema_info, "question": state["query"]})
+    history = state.get("messages", [])
+    raw_sql = sql_chain.invoke(
+        {"schema": schema_info, "history": history, "question": state["query"]}
+    )
     print("========GENERATED raw_sql query is: =====")
     print(raw_sql.content)
     generated_sql = raw_sql.content
@@ -429,7 +507,12 @@ Populate the structured response fields:
             (
                 "human",
                 """
-User Question:
+Conversation History:
+
+{history}
+
+
+Current User Question:
 
 {query}
 
@@ -449,10 +532,13 @@ Previous Evaluation Feedback (if any):
 
     chain = prompt | structured_llm
 
+    history = state.get("messages", [])
+
     result = chain.invoke(
         {
             "query": state["query"],
             "context": state["final_context"],
+            "history": history,
             "feedback": state.get("evaluation_feedback", ""),
         }
     )
@@ -462,13 +548,19 @@ Previous Evaluation Feedback (if any):
     return {
         **state,
         "response": result.model_dump(),
-        "retry_count": state.get("retry_count", 0) + 1,
+        #  "retry_count": state.get("retry_count", 0) + 1,
     }
 
 
 def evaluate_answer_node(state: RAGState) -> RAGState:
 
     print("========= INSIDE EVALUATE ANSWER NODE =========")
+    print("========= ANSWER BEING EVALUATED =========")
+    print(state["response"])
+
+    evaluate_count = state.get("evaluate_count", 0) + 1
+
+    print(f"Evaluation attempt number: {evaluate_count}")
 
     llm = _get_llm()
     structured_llm = llm.with_structured_output(EvaluationDecision)
@@ -506,7 +598,12 @@ what is missing or incorrect.
             (
                 "human",
                 """
-User Question:
+Conversation History:
+
+{history}
+
+
+Current Question:
 
 {query}
 
@@ -519,6 +616,10 @@ Retrieved Context:
 Generated Answer:
 
 {answer}
+
+Previous Evaluation Feedback:
+
+{feedback}
 """,
             ),
         ]
@@ -526,20 +627,32 @@ Generated Answer:
 
     chain = prompt | structured_llm
 
+    history = state.get("messages", [])
+
+    answer = state.get("response", {}).get("answer", "")
+
+    print("========= ANSWER SENT TO EVALUATOR =========")
+    print(answer)
+
     result = chain.invoke(
         {
             "query": state["query"],
             "context": state["final_context"],
-            "answer": state["response"]["answer"],
+            "history": history,
+            "answer": answer,
+            "feedback": state.get("evaluation_feedback", ""),
         }
     )
 
+    print("========= EVALUATOR RESULT =========")
     print(f"[evaluate_answer_node] {result.evaluation}")
+    print(result)
 
     return {
         **state,
         "evaluation": result.evaluation,
         "evaluation_feedback": result.feedback,
+        "evaluate_count": evaluate_count,
     }
 
 
@@ -589,7 +702,7 @@ def build_rag_graph():
         lambda state: (
             "PASS"
             if state["evaluation"] == "PASS"
-            else ("REGENERATE" if state["retry_count"] == 0 else "END")
+            else ("REGENERATE" if state.get("evaluate_count", 0) == 1 else "END")
         ),
         {
             "PASS": END,
@@ -598,7 +711,9 @@ def build_rag_graph():
         },
     )
 
-    search_agent = workflow.compile()
+    memory = InMemorySaver()
+
+    search_agent = workflow.compile(checkpointer=memory)
 
     # generating and saving the graph visualization
     graph_image = search_agent.get_graph().draw_mermaid_png()
@@ -615,10 +730,13 @@ def run_search_agent(query: str):
     print("============1. INSIDE run_search_agent ")
     initial_state = {
         "query": query,
+        "messages": [],
         "retrieved_docs": [],
         "reranked_docs": [],
         "response": {},
+        "evaluate_count": 0,
     }
 
     final_state = rag_graph.invoke(initial_state)
+
     return final_state["response"]
