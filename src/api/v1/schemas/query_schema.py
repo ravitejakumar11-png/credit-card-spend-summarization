@@ -1,13 +1,17 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 
-
 # query api endpoint request format
+
+
 class QueryRequest(BaseModel):
     query: str = Field(description="The user's question")
+    thread_id: str = Field(description="Conversation thread identifier")
 
 
 # query api endpoint response format
+
+
 class QueryResponse(BaseModel):
     query: str
     answer: str

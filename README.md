@@ -5,4 +5,5 @@ this repo has code to provide credit card spend for the accounts
 # uv add cohere
 # uv add langchain-community
 # uv add streamlit  
-    to run the ui use python -m streamlit run src/api/v1/ui/app.py
+    to run the ui use python -m streamlit run src/api/v1/ui/app.py 
+    or use uv run streamlit run src/api/v1/ui/app.py

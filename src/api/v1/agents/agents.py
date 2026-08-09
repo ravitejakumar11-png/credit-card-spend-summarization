@@ -13,23 +13,49 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 from typing import Literal
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import HumanMessage
 from src.api.v1.states.rag_state import RAGState
 from src.api.v1.tools.vector_search_tool import vector_search_node
 from src.api.v1.schemas.query_schema import AIResponse
 from src.core.db import get_sql_database
+from src.core.db import get_cached_schema
 
 load_dotenv()
 
 
+def _get_router_llm():
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
+    )
+
+
 def _get_llm():
     return ChatOpenAI(
-        model=os.getenv("OPENAI_CHAT_MODEL"), api_key=os.getenv("OPENAI_API_KEY")
+        model=os.getenv("OPENAI_CHAT_MODEL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
+    )
+
+
+def _get_evaluator_llm():
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
     )
 
 
 class RouteDecision(BaseModel):
-    route: Literal["VECTOR_DB", "RDBMS", "HYBRID"]
+    route: Literal[
+        "VECTOR_DB",
+        "RDBMS",
+        "HYBRID",
+        "DIRECT",
+    ]
     reason: str
+    direct_response: str
 
 
 class EvaluationDecision(BaseModel):
@@ -41,7 +67,7 @@ def router_node(state: RAGState) -> RAGState:
 
     print("========= INSIDE ROUTER NODE =========")
 
-    llm = _get_llm()
+    llm = _get_router_llm()
     structured_llm = llm.with_structured_output(RouteDecision)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -51,96 +77,67 @@ def router_node(state: RAGState) -> RAGState:
                 """
 You are the Query Router for the NorthStar Credit Card Agentic RAG System.
 
-Your responsibility is to determine where information should be retrieved from
-to answer the user's question.
+Determine which source, if any, is required to answer the user's question.
 
-There are ONLY three possible routes.
+Choose EXACTLY ONE route:
 
---------------------------------------------------
 1. VECTOR_DB
---------------------------------------------------
+Use when the answer requires information from the credit-card knowledge base, including:
+- Card features, benefits, rewards, cashback, lounge access
+- Fees, interest, billing, EMI, eligibility
+- Policies, FAQs, terms & conditions
+- Product documentation or bank rules
 
-Choose VECTOR_DB when the question is about:
-
-- Credit card features
-- Rewards program
-- Reward calculation rules
-- Cashback rules
-- Lounge access
-- Fees and charges
-- Interest calculation
-- Billing cycle
-- EMI conversion
-- Card eligibility
-- Credit card benefits
-- Policies
-- FAQs
-- Terms & Conditions
-- Product documentation
-- Bank rules
-- Any information contained in the Credit Card Knowledge Base.
-
---------------------------------------------------
 2. RDBMS
---------------------------------------------------
+Use when the answer requires only structured data from the relational database, including:
+- Customer, card, account or transaction data
+- Spending, payments, statements, balances or credit limits
+- Reward points or transaction history
+- Counts, summaries or other customer-specific data
 
-Choose RDBMS when the answer depends ONLY on structured customer data stored in
-the relational database.
-
-Examples:
-
-- Customer profile
-- Card information
-- Transactions
-- Merchant spends
-- Billing statements
-- Outstanding balance
-- Credit limit
-- Available credit
-- Reward points earned
-- Transaction history
-- Spend summary
-- Payments
-- Monthly spending
-- Transaction counts
-
---------------------------------------------------
 3. HYBRID
---------------------------------------------------
+Use when BOTH the relational database and knowledge base are required.
 
-Choose HYBRID when BOTH sources are required.
+Examples include questions requiring customer-specific data together with:
+- Reward rules
+- Fee or interest policies
+- Billing rules
+- Spend categorization rules
+- Other product or policy information
 
-Examples:
+4. DIRECT
+Use when no database or knowledge-base retrieval is required.
 
-- Why was I charged a late payment fee?
-    (Need transaction history + fee policy)
+This includes:
+- Greetings and simple conversation
+- Questions about the assistant's capabilities
+- General chit-chat
+- Questions unrelated to banking, credit cards, transactions or rewards
+- Conversational follow-ups that require no new information from the
+database or knowledge base.
 
-- Why did I earn only 200 reward points?
-    (Need transactions + reward rules)
+For DIRECT:
+- Provide a brief natural response in `direct_response` for greetings,
+  capabilities and simple conversation.
+- For unrelated questions, provide a brief polite refusal explaining
+  that the assistant is designed for NorthStar credit-card and related
+  topics.
+- Do not retrieve from the RDBMS or VECTOR_DB.
 
-- Explain my billing statement.
-    (Need statement data + billing cycle rules)
-
-- Why was interest charged?
-    (Need statement/payment data + interest policy)
-
-- Explain my spending summary.
-    (Need SQL spend data + spend categorization rules)
-
---------------------------------------------------
-
-Important Rules
-
+Routing rules:
 - Return exactly ONE route.
-- Never return more than one route.
-- If both structured customer data and product knowledge are required,
-  always choose HYBRID.
-- If unsure, prefer HYBRID rather than guessing a single source.
+- Use HYBRID whenever both structured data and knowledge-base information
+  are required.
+- Use retrieval routes only when retrieval is necessary.
+- Use conversation history to resolve references and determine whether
+  the current question is related to the ongoing conversation.
+- If unsure between a single retrieval source and HYBRID, choose HYBRID.
+- For VECTOR_DB, RDBMS and HYBRID, set `direct_response` to an empty string.
 
 Return:
-
-route
-reason
+- route
+- reason
+- direct_response
 """,
             ),
             (
@@ -171,6 +168,14 @@ reason
     return {
         **state,
         "route": decision.route,
+        "response": {
+            "query": state["query"],
+            "answer": decision.direct_response,
+            "policy_citations": "",
+            "page_no": "",
+            "document_name": "",
+            "sql_query_executed": None,
+        },
     }
 
 
@@ -181,96 +186,57 @@ def nl2sql_node(state: RAGState) -> RAGState:
     # connect to rdbms
     db = get_sql_database()
     # get the tables' live schema
-    schema_info = db.get_table_info()
+    # schema_info = db.get_table_info()
+    schema_info = get_cached_schema()
     # write the system prompt and pass on the schema to get only sql query
     sql_prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 """
-                   You are an expert SQL generator for a conversational database assistant.
+                   You are an expert PostgreSQL SQL generator for a conversational
+NorthStar Credit Card Assistant.
 
-Your task is to generate accurate PostgreSQL queries based on:
+Generate ONE valid PostgreSQL SELECT query that answers the current
+user question using the database schema, business rules and
+conversation history.
 
-1. The current user question
-2. Previous conversation history
-3. Available database schema and business rules
+## Conversation and Entity Resolution
 
+- Resolve references such as he, she, they, this customer, this card,
+  this transaction, the same one, or the previous one using conversation
+  history.
+- Preserve entities, identifiers and filters established in previous
+  turns.
+- If conversation history identifies the target entity, do not broaden
+  the query to unrelated entities.
+- Do not ask for clarification when the target can be resolved from
+  the available history.
 
-## Conversation Context Resolution Rules
+## SQL Rules
 
-The user may ask follow-up questions that depend on information mentioned earlier in the conversation.
+- Use only tables and columns present in the supplied schema.
+- Generate only the SQL required to answer the question.
+- Return ONLY raw SQL. No explanation, markdown or code fences.
+- SELECT statements only.
+- Never generate INSERT, UPDATE, DELETE, DROP or other DML/DDL.
+- Add LIMIT 50 unless the query is an aggregate.
+- For multi-word text searches, search meaningful keywords separately
+  rather than requiring the entire phrase to match.
+- Use appropriate synonyms when useful for text searches.
 
-The current question may contain references such as:
+## Final Validation
 
-- he / she / they
-- this customer
-- this account
-- this card
-- this transaction
-- the same one
-- the previous one
-- that record
+Before returning SQL, verify:
+1. It answers the current question.
+2. Conversation references are resolved correctly.
+3. Required filters are present.
+4. The query does not unnecessarily broaden the dataset.
+5. The SQL is valid PostgreSQL.
 
-Before generating SQL, you MUST resolve these references using the conversation history.
+Database schema:
 
-
-## Entity Resolution Guidelines
-
-- Identify any relevant entities already established in the conversation.
-- Maintain continuity with previously identified entities.
-- If a previous turn established a specific entity, use that entity when generating SQL.
-- Do not broaden the query unnecessarily when the context already identifies the target entity.
-
-Examples of incorrect behavior:
-
-- Returning data for all entities when the conversation context identifies a specific one.
-- Ignoring previously established identifiers.
-- Asking for clarification when the entity can be resolved from conversation history.
-
-
-## SQL Generation Rules
-
-Before generating the final SQL:
-
-1. Understand the user's intent.
-2. Resolve any ambiguous references using conversation history.
-3. Identify the required tables and relationships.
-4. Apply appropriate filters based on the resolved context.
-5. Generate only the SQL required to answer the user's question.
-
-
-## Validation Before Returning SQL
-
-Check:
-
-- Does the query answer the current user question?
-- Did I correctly resolve any references from previous conversation?
-- Am I querying a broader dataset than required?
-- Are required filtering conditions present?
-- Is the SQL syntactically valid PostgreSQL?
-
-
-If the conversation provides enough context to identify the target entity, the generated SQL should reflect that context.
-
-
-                   Rules:
-                   - Return ONLY the raw SQL — no explanation, no summary, no markdown fences, no backticks.
-                   - Use only the tables and columns present in the schema.
-                   - Do NOT generate INSERT, UPDATE, DELETE, DROP, or any DML/DDL statements.
-                   - Always add a LIMIT clause (max 50 rows) unless the question asks for aggregates.
-                   - For product or text searches: NEVER search for the full multi-word phrase as one
-                       ILIKE pattern. Instead, split the search into individual meaningful keywords
-                       and OR them together across both name and description columns.
-                       Example — user asks "wireless headset":
-                           WHERE (name ILIKE '%wireless%' OR description ILIKE '%wireless%')
-                           OR (name ILIKE '%headset%'  OR description ILIKE '%headset%')
-                           OR (name ILIKE '%headphones%' OR description ILIKE '%headphones%')
-                       Use your knowledge of synonyms (headset/headphones, laptop/notebook, etc.)
-                       to cast a wider net when the exact term may not match.
-                  
-                   Database schema:
-                   {schema}
+{schema}
                """,
             ),
             (
@@ -471,37 +437,36 @@ def generate_answer_node(state: RAGState) -> RAGState:
             (
                 "system",
                 """
-You are an expert Credit Card Customer Support Assistant for NorthStar Bank.
+You are the NorthStar Credit Card Customer Support Assistant.
 
-You are provided with:
+Answer the user's current question using only the supplied conversation
+history and retrieved context.
 
-1. Structured customer/account information retrieved from the relational database.
-2. Credit card product knowledge retrieved from the Knowledge Base.
+## Grounding Rules
 
-Instructions:
+- Do not invent facts.
+- Customer-specific facts must come from structured customer data.
+- Product features, policies, fees, rewards and rules must come from the
+  knowledge base.
+- When both sources are provided and both are required, combine them.
+- If the available context is insufficient, clearly state that the
+  information cannot be determined from the available data.
+- Resolve conversational references using the conversation history.
 
-- Answer ONLY using the provided context.
-- Never make up information.
-- If the answer requires both SQL data and Knowledge Base information,
-  combine them into one natural response.
-- If only one source is available, answer using only that source.
-- If the answer cannot be determined from the provided context,
-  politely say that the required information is unavailable.
+## Response Style
 
-When answering:
+- Be concise and business-friendly.
+- Use bullets when useful.
+- Explain numerical results clearly.
+- Do not mention SQL, databases, vector search, retrieval, prompts,
+  internal systems or internal reasoning.
 
-- Be clear and concise.
-- Use bullet points wherever appropriate.
-- Explain numbers in a business-friendly manner.
-- Never mention SQL, database, vector search or internal implementation.
-- Never expose internal reasoning.
-
-Populate the structured response fields:
-
+Populate:
 - answer
 - document_name
 - page_no
 - policy_citations
+- sql_query_executed
 """,
             ),
             (
@@ -537,7 +502,7 @@ Previous Evaluation Feedback (if any):
     result = chain.invoke(
         {
             "query": state["query"],
-            "context": state["final_context"],
+            "context": state.get("final_context", ""),
             "history": history,
             "feedback": state.get("evaluation_feedback", ""),
         }
@@ -562,7 +527,7 @@ def evaluate_answer_node(state: RAGState) -> RAGState:
 
     print(f"Evaluation attempt number: {evaluate_count}")
 
-    llm = _get_llm()
+    llm = _get_evaluator_llm()
     structured_llm = llm.with_structured_output(EvaluationDecision)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -570,29 +535,24 @@ def evaluate_answer_node(state: RAGState) -> RAGState:
             (
                 "system",
                 """
-You are an Answer Quality Evaluator for the NorthStar Credit Card Assistant.
+You are the answer-quality evaluator for the NorthStar Credit Card Assistant.
 
-Your job is NOT to answer the question.
+Evaluate the generated answer against the current question,
+conversation history, and retrieved context.
 
-Evaluate whether the generated answer:
+Return PASS only when:
+- The answer directly addresses the user's question.
+- All factual claims are supported by the supplied context.
+- No unsupported or hallucinated information is present.
+- Important information required to answer the question is included.
+- The answer is clear and concise.
 
-- Correctly answers the user's question.
-- Uses only the retrieved context.
-- Does not hallucinate information.
-- Includes all important information needed to answer the user's
-question, but avoids adding unnecessary details.
-- Is clear and complete.
+Return REGENERATE when any of these conditions fail.
 
-If the answer is satisfactory, return:
+For REGENERATE, provide short, actionable feedback describing exactly
+what is missing, incorrect, unsupported or unclear.
 
-PASS
-
-Otherwise return:
-
-REGENERATE
-
-If regeneration is needed, provide a short feedback explaining
-what is missing or incorrect.
+Do not answer the user's question.
 """,
             ),
             (
@@ -637,7 +597,7 @@ Previous Evaluation Feedback:
     result = chain.invoke(
         {
             "query": state["query"],
-            "context": state["final_context"],
+            "context": state.get("final_context", ""),
             "history": history,
             "answer": answer,
             "feedback": state.get("evaluation_feedback", ""),
@@ -679,6 +639,7 @@ def build_rag_graph():
             "VECTOR_DB": "vector_search",
             "RDBMS": "nl2sql",
             "HYBRID": "vector_search",
+            "DIRECT": END,
         },
     )
 
@@ -726,17 +687,23 @@ def build_rag_graph():
 rag_graph = build_rag_graph()
 
 
-def run_search_agent(query: str):
-    print("============1. INSIDE run_search_agent ")
+def run_search_agent(query: str, thread_id: str):
+    print("============1. INSIDE run_search_agent")
+
     initial_state = {
         "query": query,
-        "messages": [],
+        "messages": [HumanMessage(content=query)],
         "retrieved_docs": [],
         "reranked_docs": [],
         "response": {},
         "evaluate_count": 0,
     }
 
-    final_state = rag_graph.invoke(initial_state)
+    config = {"configurable": {"thread_id": thread_id}}
+
+    final_state = rag_graph.invoke(
+        initial_state,
+        config=config,
+    )
 
     return final_state["response"]

@@ -1,30 +1,158 @@
-import streamlit as st
 import uuid
 
-from langchain_core.messages import HumanMessage
+import requests
+import streamlit as st
 
-from src.api.v1.agents.agents import rag_graph
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+API_BASE_URL = "http://127.0.0.1:8000"
+
+
+# ---------------------------------------------------------------------------
+# Page configuration
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="NorthStar Credit Card Assistant",
+    page_icon="💳",
+    layout="wide",
+)
+
 
 st.title("NorthStar Credit Card Assistant")
 
 
-# ------------------------------------
+# ---------------------------------------------------------------------------
 # Create conversation thread
-# ------------------------------------
+# ---------------------------------------------------------------------------
 
 if "thread_id" not in st.session_state:
-
     st.session_state.thread_id = str(uuid.uuid4())
 
 
-# ------------------------------------
-# Display previous chat messages
-# ------------------------------------
+# ---------------------------------------------------------------------------
+# Chat history
+# ---------------------------------------------------------------------------
 
 if "chat_history" not in st.session_state:
-
     st.session_state.chat_history = []
 
+
+# ---------------------------------------------------------------------------
+# Developer Mode Sidebar
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+
+    st.header("Developer Mode")
+
+    developer_mode = st.toggle(
+        "Enable Developer Mode",
+        value=False,
+    )
+
+    if developer_mode:
+
+        st.divider()
+
+        st.subheader("Document Ingestion")
+
+        uploaded_file = st.file_uploader(
+            "Upload PDF or DOCX",
+            type=["pdf", "docx"],
+        )
+
+        if st.button(
+            "Ingest Document",
+            use_container_width=True,
+            disabled=uploaded_file is None,
+        ):
+
+            try:
+
+                with st.spinner("Uploading and ingesting document..."):
+
+                    response = requests.post(
+                        f"{API_BASE_URL}/api/v1/upload/",
+                        files={
+                            "file": (
+                                uploaded_file.name,
+                                uploaded_file.getvalue(),
+                                uploaded_file.type,
+                            )
+                        },
+                        timeout=600,
+                    )
+
+                if response.ok:
+
+                    result = response.json()
+
+                    st.success("Document ingested successfully.")
+
+                    st.json(result)
+
+                else:
+
+                    st.error(
+                        f"Ingestion failed: "
+                        f"{response.status_code} - "
+                        f"{response.text}"
+                    )
+
+            except requests.RequestException as exc:
+
+                st.error(f"Could not connect to the FastAPI server: {exc}")
+
+        st.divider()
+
+        st.subheader("Knowledge Base")
+
+        st.warning(
+            "Clearing the knowledge base will delete all "
+            "ingested documents, chunks and extracted images."
+        )
+
+        if st.button(
+            "Clear All Ingested Data",
+            use_container_width=True,
+        ):
+
+            try:
+
+                with st.spinner("Clearing ingested data..."):
+
+                    response = requests.delete(
+                        f"{API_BASE_URL}/api/v1/upload/clear",
+                        timeout=120,
+                    )
+
+                if response.ok:
+
+                    result = response.json()
+
+                    st.success("All ingested data has been cleared.")
+
+                    st.json(result)
+
+                else:
+
+                    st.error(
+                        f"Failed to clear data: "
+                        f"{response.status_code} - "
+                        f"{response.text}"
+                    )
+
+            except requests.RequestException as exc:
+
+                st.error(f"Could not connect to the FastAPI server: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Display previous chat messages
+# ---------------------------------------------------------------------------
 
 for message in st.session_state.chat_history:
 
@@ -33,43 +161,89 @@ for message in st.session_state.chat_history:
         st.write(message["content"])
 
 
-# ------------------------------------
+# ---------------------------------------------------------------------------
 # User input
-# ------------------------------------
+# ---------------------------------------------------------------------------
 
 if query := st.chat_input("Ask your credit card question..."):
 
-    # display user message
+    # -----------------------------------------------------------------------
+    # Display user message
+    # -----------------------------------------------------------------------
 
-    st.session_state.chat_history.append({"role": "user", "content": query})
+    st.session_state.chat_history.append(
+        {
+            "role": "user",
+            "content": query,
+        }
+    )
 
     with st.chat_message("user"):
 
         st.write(query)
 
-    # --------------------------------
-    # LangGraph invocation
-    # --------------------------------
+    # -----------------------------------------------------------------------
+    # Call FastAPI query endpoint
+    # -----------------------------------------------------------------------
 
-    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+    try:
 
-    response = rag_graph.invoke(
-        {
-            "query": query,
-            "messages": [HumanMessage(content=query)],
-            "evaluate_count": 0,
-        },
-        config=config,
-    )
+        with st.chat_message("assistant"):
 
-    answer = response["response"]["answer"]
+            with st.spinner("Thinking..."):
 
-    # --------------------------------
-    # Display assistant response
-    # --------------------------------
+                response = requests.post(
+                    f"{API_BASE_URL}/api/v1/query/",
+                    json={
+                        "query": query,
+                        "thread_id": st.session_state.thread_id,
+                    },
+                    timeout=300,
+                )
 
-    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            if response.ok:
 
-    with st.chat_message("assistant"):
+                result = response.json()
 
-        st.write(answer)
+                answer = result["answer"]
+
+                st.write(answer)
+
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                    }
+                )
+
+            else:
+
+                error_message = (
+                    f"API request failed: "
+                    f"{response.status_code} - "
+                    f"{response.text}"
+                )
+
+                st.error(error_message)
+
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": error_message,
+                    }
+                )
+
+    except requests.RequestException as exc:
+
+        error_message = f"Could not connect to the FastAPI server: {exc}"
+
+        with st.chat_message("assistant"):
+
+            st.error(error_message)
+
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "content": error_message,
+            }
+        )

@@ -1,13 +1,13 @@
-from typing import TypedDict, List
+from typing import TypedDict, List, Annotated
 from langchain_core.documents import Document
-from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 # from pydantic import BaseModel
 
 
 # state for the agent
 class RAGState(TypedDict):
-    messages: list[BaseMessage]
+    messages: Annotated[list, add_messages]
     query: str
     retrieved_docs: List[Document]
     reranked_docs: List[Document]
