@@ -23,3 +23,4 @@ class RAGState(TypedDict):
     evaluation: str
     evaluate_count: int
     evaluation_feedback: str
+    retrieval_attempt: int

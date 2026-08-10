@@ -750,6 +750,60 @@ Previous Evaluation Feedback:
     }
 
 
+def should_reformulate_after_search(state: RAGState) -> bool:
+
+    docs = state.get("retrieved_docs", [])
+    attempt = state.get("retrieval_attempt", 0)
+
+    # Never reformulate more than once
+    if attempt >= 2:
+        return False
+
+    # No results
+    if not docs:
+        print("[retrieval_quality] No documents found. " "Reformulating query.")
+        return True
+
+    similarity_threshold = 0.50
+
+    relevant_docs = [
+        doc
+        for doc in docs
+        if (
+            doc.metadata.get("similarity") is not None
+            and doc.metadata.get("similarity") >= similarity_threshold
+        )
+    ]
+
+    top_similarity = docs[0].metadata.get("similarity")
+
+    print(
+        f"[retrieval_quality] "
+        f"Top similarity: {top_similarity} | "
+        f"Relevant docs: {len(relevant_docs)} | "
+        f"Attempt: {attempt}"
+    )
+
+    if len(relevant_docs) < 3:
+        print("[retrieval_quality] Retrieval quality is low. " "Reformulating query.")
+        return True
+
+    print(
+        "[retrieval_quality] Retrieval quality is sufficient. "
+        "Skipping reformulation."
+    )
+
+    return False
+
+
+def route_after_vector_search(state: RAGState) -> str:
+
+    if should_reformulate_after_search(state):
+        return "REFORMULATE"
+
+    return "CONTINUE"
+
+
 def build_rag_graph():
     workflow = StateGraph(RAGState)
 
@@ -771,16 +825,21 @@ def build_rag_graph():
         "router",
         lambda state: state["route"],
         {
-            "VECTOR_DB": "query_reformulation",
+            "VECTOR_DB": "vector_search",
             "RDBMS": "nl2sql",
-            "HYBRID": "query_reformulation",
+            "HYBRID": "vector_search",
             "DIRECT": END,
         },
     )
-
+    workflow.add_conditional_edges(
+        "vector_search",
+        route_after_vector_search,
+        {
+            "REFORMULATE": "query_reformulation",
+            "CONTINUE": "rerank",
+        },
+    )
     workflow.add_edge("query_reformulation", "vector_search")
-    workflow.add_edge("vector_search", "rerank")
-
     workflow.add_conditional_edges(
         "rerank",
         lambda state: state["route"],
@@ -842,6 +901,7 @@ def run_search_agent(query: str, thread_id: str):
         "evaluation": "",
         "evaluate_count": 0,
         "evaluation_feedback": "",
+        "retrieval_attempt": 0,
     }
 
     config = {"configurable": {"thread_id": thread_id}}
