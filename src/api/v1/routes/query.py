@@ -7,5 +7,8 @@ router = APIRouter(prefix="/api/v1/query")
 
 @router.post("/")
 def query_endpoint(request: QueryRequest) -> QueryResponse:
-    docs = query_documents(request.query)
+    docs = query_documents(
+        query=request.query,
+        thread_id=request.thread_id,
+    )
     return docs

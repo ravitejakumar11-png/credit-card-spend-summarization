@@ -73,6 +73,8 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
 # import time when the DB is not yet available (e.g. during tests).
 # ---------------------------------------------------------------------------
 _pool: ConnectionPool | None = None
+_sql_database: SQLDatabase | None = None
+_sql_schema: str | None = None
 
 
 def _get_pool() -> ConnectionPool:
@@ -128,6 +130,96 @@ def upsert_document(filename: str, source_path: str) -> str:
             row = cur.fetchone()
         conn.commit()
     return str(row["id"])
+
+
+# ---------------------------------------------------------------------------
+# Delete all ingested data
+# ---------------------------------------------------------------------------
+
+
+def delete_all_ingested_data() -> dict:
+    """
+    Delete all ingested documents and associated data.
+
+    Database:
+        - Deletes all rows from documents.
+        - multimodal_chunks are deleted automatically through
+          ON DELETE CASCADE.
+
+    Filesystem:
+        - Deletes ingested PDF/DOCX files from data/
+        - Deletes extracted images from data/images/
+    """
+
+    # ---------------------------------------------------------
+    # Step 1: Delete database records
+    # ---------------------------------------------------------
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM documents")
+            documents_deleted = cur.rowcount
+
+        conn.commit()
+
+    # ---------------------------------------------------------
+    # Step 2: Delete uploaded source documents
+    # ---------------------------------------------------------
+
+    data_dir = pathlib.Path("data")
+
+    source_files_deleted = 0
+
+    if data_dir.exists():
+
+        supported_extensions = {
+            ".pdf",
+            ".docx",
+        }
+
+        for file_path in data_dir.iterdir():
+
+            if file_path.is_file() and file_path.suffix.lower() in supported_extensions:
+                try:
+                    file_path.unlink()
+                    source_files_deleted += 1
+
+                except OSError as exc:
+                    print(f"[db] Could not delete source file " f"{file_path}: {exc}")
+
+    # ---------------------------------------------------------
+    # Step 3: Delete extracted images
+    # ---------------------------------------------------------
+
+    image_dir = data_dir / "images"
+
+    images_deleted = 0
+
+    if image_dir.exists():
+
+        for image_file in image_dir.iterdir():
+
+            if image_file.is_file():
+
+                try:
+                    image_file.unlink()
+                    images_deleted += 1
+
+                except OSError as exc:
+                    print(f"[db] Could not delete image " f"{image_file}: {exc}")
+
+    print(
+        f"[db] Deleted {documents_deleted} documents, "
+        f"associated multimodal chunks, "
+        f"{source_files_deleted} source files, "
+        f"and {images_deleted} image files."
+    )
+
+    return {
+        "documents_deleted": documents_deleted,
+        "source_files_deleted": source_files_deleted,
+        "images_deleted": images_deleted,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -441,13 +533,21 @@ def search_vector_store(query: str, k: int = 20) -> list[Document]:
 
 def get_sql_database() -> SQLDatabase:
     """
-    uses read only credentials and connect to rdbms.
-    and targets specific tables our agent can access
+    Return the cached SQLDatabase instance.
+
+    The SQLDatabase object is created only once and reused
+    for subsequent NL2SQL requests.
     """
-    if not pg_rdbms_connection:
-        raise ValueError("PG_RDBMS_CONNECTION_STRING is not set. Check your .env")
-    else:
-        return SQLDatabase.from_uri(
+    global _sql_database
+
+    if _sql_database is None:
+
+        if not pg_rdbms_connection:
+            raise ValueError("PG_RDBMS_CONNECTION_STRING is not set. Check your .env")
+
+        print("========== Initializing RDBMS SQLDatabase ==========")
+
+        _sql_database = SQLDatabase.from_uri(
             pg_rdbms_connection,
             include_tables=[
                 "billing_statements",
@@ -456,5 +556,30 @@ def get_sql_database() -> SQLDatabase:
                 "customers",
                 "reward_transactions",
             ],
-            # TODO: sample rows in table info
         )
+
+        print("========== RDBMS SQLDatabase cached ==========")
+
+    return _sql_database
+
+
+def get_cached_schema() -> str:
+    """
+    Return the cached RDBMS schema.
+
+    The schema is loaded from PostgreSQL only once per application
+    process and reused for subsequent NL2SQL requests.
+    """
+    global _sql_schema
+
+    if _sql_schema is None:
+
+        db = get_sql_database()
+
+        print("========== Loading RDBMS schema ==========")
+
+        _sql_schema = db.get_table_info()
+
+        print("========== RDBMS schema cached ==========")
+
+    return _sql_schema

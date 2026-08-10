@@ -5,6 +5,10 @@ from typing import Optional
 # query api endpoint request format
 class QueryRequest(BaseModel):
     query: str = Field(description="The user's question")
+    thread_id: Optional[str] = Field(
+        default=None,
+        description="Conversation thread identifier used to maintain chat context",
+    )
 
 
 # query api endpoint response format
