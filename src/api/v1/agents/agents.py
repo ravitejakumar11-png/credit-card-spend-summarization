@@ -41,7 +41,7 @@ def _get_llm():
 
 def _get_evaluator_llm():
     return ChatOpenAI(
-        model="gpt-4o-mini",
+        model=os.getenv("OPENAI_CHAT_MODEL"),
         api_key=os.getenv("OPENAI_API_KEY"),
         temperature=0,
     )
@@ -95,6 +95,27 @@ Use when the answer requires only structured data from the relational database, 
 - Reward points or transaction history
 - Counts, summaries or other customer-specific data
 
+RDBMS is for actual customer-specific data, not generic questions about
+how the product or reward program works.
+
+Use RDBMS when the question asks for actual or historical customer data,
+such as:
+- what the customer spent
+- what the customer earned
+- transaction history
+- balances
+- payments
+- statements
+- customer/card details
+
+A generic question about earning rates, benefits, eligibility, fees,
+rules, or policies is VECTOR_DB even if phrased using "I", "my", or "me".
+
+Examples:
+- "How many points do I earn for dining?" → VECTOR_DB
+- "How many points did I earn for dining last month?" → RDBMS
+- "What is the dining reward rate?" → VECTOR_DB
+
 3. HYBRID
 Use when BOTH the relational database and knowledge base are required.
 
@@ -104,6 +125,13 @@ Examples include questions requiring customer-specific data together with:
 - Billing rules
 - Spend categorization rules
 - Other product or policy information
+
+Use HYBRID only when the answer genuinely requires BOTH:
+1. actual customer/transaction data, and
+2. knowledge-base rules or policies.
+
+Do not use HYBRID merely because the question mentions rewards,
+spending, fees, or another topic that exists in both sources.
 
 4. DIRECT
 Use when no database or knowledge-base retrieval is required.
@@ -176,6 +204,72 @@ Return:
             "document_name": "",
             "sql_query_executed": None,
         },
+    }
+
+
+def query_reformulation_node(state: RAGState) -> RAGState:
+    print("========= INSIDE QUERY REFORMULATION NODE =========")
+
+    llm = _get_router_llm()
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+You rewrite user questions into effective search queries for the
+NorthStar Credit Card knowledge base.
+
+Create ONE standalone retrieval query.
+
+Use conversation history to resolve references such as:
+he, she, this, that, previous, same, what about, how about.
+
+Also expand important domain terms with closely related terms when useful
+for document retrieval.
+
+Rules:
+- Preserve the user's intent.
+- Resolve conversational references using history.
+- Add useful credit-card terminology or synonyms when they improve retrieval.
+- Do not answer the question.
+- Do not invent facts, policies, names, amounts, dates, or rules.
+- Do not introduce information that is not present in the question or history.
+- If the question is already clear, make only useful retrieval improvements.
+- Return only the search query.
+""",
+            ),
+            (
+                "human",
+                """
+Conversation History:
+{history}
+
+Current Question:
+{query}
+""",
+            ),
+        ]
+    )
+
+    chain = prompt | llm
+
+    result = chain.invoke(
+        {
+            "history": state.get("messages", []),
+            "query": state["query"],
+        }
+    )
+
+    retrieval_query = result.content.strip()
+
+    print("========= QUERY REFORMULATION =========")
+    print(f"Original Query   : {state['query']}")
+    print(f"Retrieval Query  : {retrieval_query}")
+
+    return {
+        **state,
+        "retrieval_query": retrieval_query,
     }
 
 
@@ -322,11 +416,12 @@ def rerank_node(state: RAGState):
     # send the query and the retrieved_docs to the reranking model
 
     docs = state["retrieved_docs"]
+    search_query = state.get("retrieval_query") or state["query"]
 
     print("=======3. INSIDE rerank_node. Before calling reranker =========")
     rerank_response = co.rerank(
         model="rerank-v3.5",
-        query=state["query"],
+        query=search_query,
         documents=[doc.page_content for doc in docs],
         top_n=5,
     )
@@ -353,12 +448,15 @@ def merge_context_node(state: RAGState) -> RAGState:
 
     print("========= INSIDE MERGE CONTEXT NODE =========")
 
+    route = state.get("route")
+
     # ----------------------------------------------------------
     # Prepare SQL Context
     # ----------------------------------------------------------
     sql_context = ""
 
-    if state.get("sql_result"):
+    if route in ("RDBMS", "HYBRID") and state.get("sql_result"):
+
         sql_context = f"""
         ==========================
         STRUCTURED CUSTOMER DATA
@@ -376,7 +474,7 @@ def merge_context_node(state: RAGState) -> RAGState:
     # ----------------------------------------------------------
     vector_context = ""
 
-    if state.get("reranked_docs"):
+    if route in ("VECTOR_DB", "HYBRID") and state.get("reranked_docs"):
 
         vector_chunks = []
 
@@ -402,7 +500,7 @@ def merge_context_node(state: RAGState) -> RAGState:
         )
 
     # ----------------------------------------------------------
-    # Merge both contexts
+    # Merge contexts
     # ----------------------------------------------------------
     contexts = []
 
@@ -414,6 +512,7 @@ def merge_context_node(state: RAGState) -> RAGState:
 
     final_context = "\n\n".join(contexts)
 
+    print(f"Route                  : {route}")
     print(f"SQL Context Present    : {bool(sql_context)}")
     print(f"Vector Context Present : {bool(vector_context)}")
 
@@ -437,21 +536,30 @@ def generate_answer_node(state: RAGState) -> RAGState:
             (
                 "system",
                 """
-You are the NorthStar Credit Card Customer Support Assistant.
+SOURCE ACCURACY
 
-Answer the user's current question using only the supplied conversation
-history and retrieved context.
+Answer using only the supplied context.
 
-## Grounding Rules
+Preserve the exact meaning and scope of the source.
 
-- Do not invent facts.
-- Customer-specific facts must come from structured customer data.
-- Product features, policies, fees, rewards and rules must come from the
-  knowledge base.
-- When both sources are provided and both are required, combine them.
-- If the available context is insufficient, clearly state that the
-  information cannot be determined from the available data.
-- Resolve conversational references using the conversation history.
+Do not generalize, infer, or expand policy statements.
+
+If the source says an exclusion applies to a specific portion,
+condition, transaction type, or circumstance, apply the exclusion only
+to that scope.
+
+Do not convert:
+"X portion is excluded"
+into:
+"X is excluded."
+
+Do not convert:
+"X transactions are excluded"
+into:
+"all X spending is excluded."
+
+When a table and an explanatory note appear together, interpret them
+together and preserve both the earning rule and its exceptions.
 
 ## Response Style
 
@@ -535,24 +643,50 @@ def evaluate_answer_node(state: RAGState) -> RAGState:
             (
                 "system",
                 """
-You are the answer-quality evaluator for the NorthStar Credit Card Assistant.
+You are the answer evaluator for a credit-card RAG system.
 
-Evaluate the generated answer against the current question,
-conversation history, and retrieved context.
+Evaluate the generated answer against the retrieved context.
 
-Return PASS only when:
-- The answer directly addresses the user's question.
-- All factual claims are supported by the supplied context.
-- No unsupported or hallucinated information is present.
-- Important information required to answer the question is included.
-- The answer is clear and concise.
+PASS if:
 
-Return REGENERATE when any of these conditions fail.
+1. The answer is supported by the retrieved context.
+2. The answer does not contradict the retrieved context.
+3. Important qualifiers, conditions, exceptions and scope are preserved.
+4. The answer directly addresses the user's question.
 
-For REGENERATE, provide short, actionable feedback describing exactly
-what is missing, incorrect, unsupported or unclear.
+REGENERATE if:
 
-Do not answer the user's question.
+1. The answer contradicts the retrieved context.
+2. The answer makes an unsupported claim.
+3. The answer omits a condition that materially changes the meaning.
+4. The answer fails to answer the question.
+
+IMPORTANT:
+
+Use only the retrieved context as the factual authority.
+
+Do not substitute general knowledge for retrieved information.
+
+Do not broaden or narrow the scope of a policy statement.
+
+Evaluate strictly against the retrieved context and preserve the exact scope of qualifiers, 
+conditions and exceptions. Do not broaden a specific exclusion into a broader exclusion.
+
+Preserve qualifiers such as:
+- only
+- except
+- portion
+- subject to
+- up to
+- minimum
+- maximum
+- per transaction
+- per statement
+- per month
+- per year
+
+When the source contains a specific exception, preserve that exception
+rather than generalizing it to the entire category..
 """,
             ),
             (
@@ -622,6 +756,7 @@ def build_rag_graph():
     workflow.add_node("router", router_node)
     workflow.add_node("nl2sql", nl2sql_node)
     workflow.add_node("vector_search", vector_search_node)
+    workflow.add_node("query_reformulation", query_reformulation_node)
     workflow.add_node("rerank", rerank_node)
 
     workflow.add_node("merge_context", merge_context_node)
@@ -636,13 +771,14 @@ def build_rag_graph():
         "router",
         lambda state: state["route"],
         {
-            "VECTOR_DB": "vector_search",
+            "VECTOR_DB": "query_reformulation",
             "RDBMS": "nl2sql",
-            "HYBRID": "vector_search",
+            "HYBRID": "query_reformulation",
             "DIRECT": END,
         },
     )
 
+    workflow.add_edge("query_reformulation", "vector_search")
     workflow.add_edge("vector_search", "rerank")
 
     workflow.add_conditional_edges(
@@ -692,11 +828,20 @@ def run_search_agent(query: str, thread_id: str):
 
     initial_state = {
         "query": query,
+        "retrieval_query": "",
         "messages": [HumanMessage(content=query)],
+        "route": "",
         "retrieved_docs": [],
         "reranked_docs": [],
+        "generated_sql": "",
+        "sql_result": "",
+        "vector_context": "",
+        "sql_context": "",
+        "final_context": "",
         "response": {},
+        "evaluation": "",
         "evaluate_count": 0,
+        "evaluation_feedback": "",
     }
 
     config = {"configurable": {"thread_id": thread_id}}

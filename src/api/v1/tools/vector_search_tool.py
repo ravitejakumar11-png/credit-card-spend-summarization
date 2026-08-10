@@ -3,15 +3,17 @@ from src.core.db import search_vector_store
 
 
 def vector_search_node(state: RAGState):
-
     print("====== INSIDE vector_search_node ======")
 
+    search_query = state.get("retrieval_query") or state["query"]
+
     docs = search_vector_store(
-        query=state["query"],
+        query=search_query,
         k=20,
     )
 
-    print(f"Query                : {state['query']}")
+    print(f"Original Query       : {state['query']}")
+    print(f"Retrieval Query      : {search_query}")
     print(f"Retrieved Documents  : {len(docs)}")
 
     if docs:
