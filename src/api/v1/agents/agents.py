@@ -1,334 +1,195 @@
-# ============================================================================
-# agent.py
-# ============================================================================
-
 import os
-from typing import Literal, Optional
 
 import cohere
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import InMemorySaver
-
+from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
+from typing import Literal
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import HumanMessage, AIMessage
 
 from src.api.v1.states.rag_state import RAGState
 from src.api.v1.tools.vector_search_tool import vector_search_node
 from src.api.v1.schemas.query_schema import AIResponse
 from src.core.db import get_sql_database
-
-# ============================================================================
-# Environment
-# ============================================================================
+from src.core.db import get_cached_schema
 
 load_dotenv()
 
 
-# ============================================================================
-# LLM
-# ============================================================================
+def _get_router_llm():
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
+    )
 
 
 def _get_llm():
-
     return ChatOpenAI(
         model=os.getenv("OPENAI_CHAT_MODEL"),
         api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
     )
 
 
-# ============================================================================
-# Router Decision
-# ============================================================================
+def _get_evaluator_llm():
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_CHAT_MODEL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
+    )
 
 
 class RouteDecision(BaseModel):
-
     route: Literal[
-        "CHITCHAT",
-        "VECTOR_ONLY",
-        "RDBMS_ONLY",
+        "VECTOR_DB",
+        "RDBMS",
         "HYBRID",
+        "DIRECT",
     ]
-
     reason: str
-
-    # Used only when route == CHITCHAT
-    answer: Optional[str] = None
+    direct_response: str
 
 
-# ============================================================================
-# Router Node
-# ============================================================================
-#
-# The router now performs TWO responsibilities:
-#
-# 1. Detect CHITCHAT
-# 2. Route RAG questions to:
-#       VECTOR_ONLY
-#       RDBMS_ONLY
-#       HYBRID
-#
-# If CHITCHAT is detected:
-#
-#       router -> END
-#
-# No other node is executed.
-# ============================================================================
+class EvaluationDecision(BaseModel):
+    evaluation: Literal["PASS", "REGENERATE"]
+    feedback: str
 
 
-def router_node(state: RAGState):
+def router_node(state: RAGState) -> RAGState:
 
-    print("========== INSIDE ROUTER NODE ==========")
+    print("========= INSIDE ROUTER NODE =========")
 
-    llm = _get_llm()
-
+    llm = _get_router_llm()
     structured_llm = llm.with_structured_output(RouteDecision)
-
-    query = state["query"]
-
-    print(
-        "[router_node] Current query:",
-        query,
-    )
-
-    # ------------------------------------------------------------------------
-    # Router Prompt
-    # ------------------------------------------------------------------------
 
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 """
-You are the first-stage router for a Credit Card
-Agentic RAG System.
+You are the Query Router for the NorthStar Credit Card Agentic RAG System.
 
-Your job is to classify the user's CURRENT message.
+Determine which source, if any, is required to answer the user's question.
 
-You MUST select exactly ONE of these routes:
+Choose EXACTLY ONE route:
 
-1. CHITCHAT
-2. VECTOR_ONLY
-3. RDBMS_ONLY
-4. HYBRID
+1. VECTOR_DB
+
+Use when the answer requires information from the credit-card knowledge base, including:
+
+- Card features, benefits, rewards, cashback, lounge access
+- Fees, interest, billing, EMI, eligibility
+- Policies, FAQs, terms & conditions
+- Product documentation or bank rules
 
 
-======================================================================
-CHITCHAT
-======================================================================
+2. RDBMS
 
-Use CHITCHAT when the user is having normal casual conversation
-and the request does NOT require documents or customer database
-information.
+Use when the answer requires only structured data from the relational database, including:
 
-Examples:
+- Customer, card, account or transaction data
+- Spending, payments, statements, balances or credit limits
+- Reward points or transaction history
+- Counts, summaries or other customer-specific data
 
-- Hi
-- Hello
-- Hey
-- Good morning
-- Good afternoon
-- How are you?
-- How are you doing?
-- What can you do?
-- Who are you?
-- Thanks
-- Thank you
-- Thank you so much
-- Okay
-- Great
-- Nice
-- Bye
-- Goodbye
-- See you later
-- Have a nice day
+RDBMS is for actual customer-specific data, not generic questions about
+how the product or reward program works.
 
-CHITCHAT also includes simple conversational acknowledgements
-that do not require document or database information.
+Use RDBMS when the question asks for actual or historical customer data,
+such as:
+
+- what the customer spent
+- what the customer earned
+- transaction history
+- balances
+- payments
+- statements
+- customer/card details
+
+A generic question about earning rates, benefits, eligibility, fees,
+rules, or policies is VECTOR_DB even if phrased using "I", "my", or "me".
 
 Examples:
 
-User: Thanks
-User: That's helpful
-User: Okay
-User: Got it
-
-For CHITCHAT:
-
-- Do NOT use vector search.
-- Do NOT use the database.
-- Do NOT use SQL.
-- Do NOT use document retrieval.
-- Do NOT use reranking.
-- Do NOT use generate_answer.
-- Return a short, natural conversational response in `answer`.
-
-The `answer` field MUST contain the response that should be
-returned directly to the user.
-
-Examples:
-
-User:
-Hi
-
-Route:
-CHITCHAT
-
-Answer:
-Hello! How can I help you today?
+- "How many points do I earn for dining?" → VECTOR_DB
+- "How many points did I earn for dining last month?" → RDBMS
+- "What is the dining reward rate?" → VECTOR_DB
 
 
-User:
-How are you?
+3. HYBRID
 
-Route:
-CHITCHAT
+Use when BOTH the relational database and knowledge base are required.
 
-Answer:
-I'm doing well, thank you! How can I help you with your
-credit card today?
+Examples include questions requiring customer-specific data together with:
 
+- Reward rules
+- Fee or interest policies
+- Billing rules
+- Spend categorization rules
+- Other product or policy information
 
-User:
-Thanks
+Use HYBRID only when the answer genuinely requires BOTH:
 
-Route:
-CHITCHAT
+1. actual customer/transaction data
+2. knowledge-base rules or policies
 
-Answer:
-You're welcome! Let me know if you need anything else.
-
-
-======================================================================
-VECTOR_ONLY
-======================================================================
-
-Use VECTOR_ONLY when the answer exists only in the uploaded
-documents / knowledge base.
-
-Examples:
-
-- What are the reward benefits of Platinum card?
-- What is the cashback policy?
-- What are the annual fees?
-- What is the late payment fee?
-- What are the eligibility requirements?
-- What are the benefits of this card?
-- What is the reward points policy?
-- What is the card's annual fee?
+Do not use HYBRID merely because the question mentions rewards,
+spending, fees, or another topic that exists in both sources.
 
 
-======================================================================
-RDBMS_ONLY
-======================================================================
+4. DIRECT
 
-Use RDBMS_ONLY when the answer requires only
-customer-specific transactional/database information.
+Use when no database or knowledge-base retrieval is required.
 
-Examples:
+This includes:
 
-- Show my last 5 transactions
-- What did I spend this month?
-- What is my current outstanding balance?
-- Show my recent payments
-- How much did I spend last month?
-- What is my current balance?
-- Show my transactions
-- How much have I spent?
+- Greetings and simple conversation
+- Questions about the assistant's capabilities
+- General chit-chat
+- Questions unrelated to banking, credit cards, transactions or rewards
+- Conversational follow-ups that require no new information from the
+  database or knowledge base.
 
+For DIRECT:
 
-======================================================================
-HYBRID
-======================================================================
+- Provide a brief natural response in `direct_response` for greetings,
+  capabilities and simple conversation.
+- For unrelated questions, provide a brief polite refusal explaining
+  that the assistant is designed for NorthStar credit-card and related
+  topics.
+- Do not retrieve from the RDBMS or VECTOR_DB.
 
-Use HYBRID when the answer requires BOTH:
+Routing rules:
 
-1. Product/policy information from documents
-2. Customer-specific information from the database
-
-Examples:
-
-- How many reward points will I earn for my spending?
-- Am I eligible for this offer?
-- Based on my spend, which reward category applies?
-- What cashback will I get for my transactions?
-- Based on my spending, which card benefit applies?
-- Which reward benefit applies to my transactions?
-
-
-======================================================================
-IMPORTANT ROUTING RULE
-======================================================================
-
-First determine whether the message is CHITCHAT.
-
-If it is normal casual conversation, return CHITCHAT.
-
-If it is a question about credit card policies, benefits,
-fees, eligibility, rewards, or other knowledge-base information,
-use VECTOR_ONLY.
-
-If it requires customer-specific transaction or account data,
-use RDBMS_ONLY.
-
-If it requires BOTH document information and customer-specific
-database information, use HYBRID.
-
-Do not classify a genuine credit-card information request
-as CHITCHAT merely because it is phrased conversationally.
-
-For example:
-
-"Hi, what is the annual fee for my Platinum card?"
-
-This is NOT CHITCHAT.
-
-It should be:
-
-VECTOR_ONLY
-
-Similarly:
-
-"Hey, how much did I spend this month?"
-
-This is NOT CHITCHAT.
-
-It should be:
-
-RDBMS_ONLY.
-
-
-======================================================================
-CHITCHAT ANSWER
-======================================================================
-
-When route == CHITCHAT:
-
-Generate a short, helpful response directly in the `answer`
-field.
-
-Do not answer any credit-card policy, transaction, balance,
-reward, eligibility, or database question in the CHITCHAT answer.
-
-For RAG questions, set `answer` to null.
-
+- Return exactly ONE route.
+- Use HYBRID whenever both structured data and knowledge-base information
+  are required.
+- Use retrieval routes only when retrieval is necessary.
+- Use conversation history to resolve references and determine whether
+  the current question is related to the ongoing conversation.
+- If unsure between a single retrieval source and HYBRID, choose HYBRID.
+- For VECTOR_DB, RDBMS and HYBRID, set `direct_response` to an empty string.
 
 Return:
 
 - route
 - reason
-- answer
+- direct_response
 """,
             ),
             (
                 "human",
                 """
-Current user question:
+Conversation History:
+
+{history}
+
+Current User Question:
 
 {query}
 """,
@@ -340,122 +201,184 @@ Current user question:
 
     decision = chain.invoke(
         {
-            "query": query,
+            "query": state["query"],
+            "history": state.get("messages", []),
         }
     )
 
-    print(f"[router_node] Decision: {decision.route}")
-
+    print(f"[router_node] Route : {decision.route}")
     print(f"[router_node] Reason: {decision.reason}")
-
-    # ------------------------------------------------------------------------
-    # CHITCHAT
-    # ------------------------------------------------------------------------
-    #
-    # The router itself generates the response.
-    #
-    # The graph will then route directly to END.
-    #
-    # No other RAG node will execute.
-    # ------------------------------------------------------------------------
-
-    if decision.route == "CHITCHAT":
-
-        answer = decision.answer or "Hello! How can I help you today?"
-
-        print("[router_node] CHITCHAT detected.")
-
-        print(
-            "[router_node] Direct answer:",
-            answer,
-        )
-
-        return {
-            "route": "CHITCHAT",
-            "response": {
-                "query": query,
-                "answer": answer,
-                "document_name": "N/A",
-                "page_no": "N/A",
-                "policy_citations": "N/A",
-                "sql_query_executed": None,
-            },
-        }
-
-    # ------------------------------------------------------------------------
-    # RAG routes
-    # ------------------------------------------------------------------------
 
     return {
         "route": decision.route,
+        "response": {
+            "query": state["query"],
+            "answer": decision.direct_response,
+            "policy_citations": "",
+            "page_no": "",
+            "document_name": "",
+            "sql_query_executed": None,
+        },
     }
 
 
-# ============================================================================
-# NL2SQL Node
-# ============================================================================
+def hybrid_start_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE HYBRID START NODE =========")
+
+    return {}
+
+
+def hybrid_join_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE HYBRID JOIN NODE =========")
+
+    return {}
+
+
+def query_reformulation_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE QUERY REFORMULATION NODE =========")
+
+    llm = _get_router_llm()
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+You rewrite user questions into effective search queries for the
+NorthStar Credit Card knowledge base.
+
+Create ONE standalone retrieval query.
+
+Use conversation history to resolve references such as:
+he, she, this, that, previous, same, what about, how about.
+
+Also expand important domain terms with closely related terms when useful
+for document retrieval.
+
+Rules:
+
+- Preserve the user's intent.
+- Resolve conversational references using history.
+- Add useful credit-card terminology or synonyms when they improve retrieval.
+- Do not answer the question.
+- Do not invent facts, policies, names, amounts, dates, or rules.
+- Do not introduce information that is not present in the question or history.
+- If the question is already clear, make only useful retrieval improvements.
+- Return only the search query.
+""",
+            ),
+            (
+                "human",
+                """
+Conversation History:
+
+{history}
+
+Current Question:
+
+{query}
+""",
+            ),
+        ]
+    )
+
+    chain = prompt | llm
+
+    result = chain.invoke(
+        {
+            "history": state.get("messages", []),
+            "query": state["query"],
+        }
+    )
+
+    retrieval_query = result.content.strip()
+
+    print("========= QUERY REFORMULATION =========")
+    print(f"Original Query  : {state['query']}")
+    print(f"Retrieval Query : {retrieval_query}")
+
+    return {
+        "retrieval_query": retrieval_query,
+    }
 
 
 def nl2sql_node(state: RAGState) -> RAGState:
 
-    print("========== INSIDE NL2SQL NODE ==========")
+    print("========= INSIDE NL2SQL NODE =========")
 
     llm = _get_llm()
 
     db = get_sql_database()
 
-    # ------------------------------------------------------------------------
-    # Get live database schema
-    # ------------------------------------------------------------------------
-
-    schema_info = db.get_table_info()
-
-    # ------------------------------------------------------------------------
-    # SQL generation prompt
-    # ------------------------------------------------------------------------
+    schema_info = get_cached_schema()
 
     sql_prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 """
-You are a PostgreSQL expert.
+You are an expert PostgreSQL SQL generator for a conversational
+NorthStar Credit Card Assistant.
 
-Given the database schema below, write a single valid
-SELECT query that answers the user's question.
+Generate ONE valid PostgreSQL SELECT query that answers the current
+user question using the database schema, business rules and
+conversation history.
 
-Rules:
+## Conversation and Entity Resolution
 
-- Return ONLY the raw SQL.
+- Resolve references such as he, she, they, this customer, this card,
+  this transaction, the same one, or the previous one using conversation
+  history.
+- Preserve entities, identifiers and filters established in previous
+  turns.
+- If conversation history identifies the target entity, do not broaden
+  the query to unrelated entities.
+- Do not ask for clarification when the target can be resolved from the
+  available history.
 
-- No explanation.
+## SQL Rules
 
-- No summary.
+- Use only tables and columns present in the supplied schema.
+- Generate only the SQL required to answer the question.
+- Return ONLY raw SQL. No explanation, markdown or code fences.
+- SELECT statements only.
+- Never generate INSERT, UPDATE, DELETE, DROP or other DML/DDL.
+- Add LIMIT 50 unless the query is an aggregate.
+- For multi-word text searches, search meaningful keywords separately
+  rather than requiring the entire phrase to match.
+- Use appropriate synonyms when useful for text searches.
+Reward points have multiple meanings in the database:
 
-- No markdown fences.
+- credit_cards.reward_points:
+  Current reward-point balance on the card.
 
-- No backticks.
+- card_transactions.reward_pts_earned:
+  Reward points attributed to individual card transactions.
 
-- Use only the tables and columns present in the schema.
+- reward_transactions.points_earned:
+  Reward points posted through the reward ledger.
 
-- Do NOT generate:
-  INSERT
-  UPDATE
-  DELETE
-  DROP
-  ALTER
-  TRUNCATE
-  or any other DML/DDL.
+Do not treat these fields as interchangeable.
 
-- Always add a LIMIT clause with a maximum of 50 rows
-  unless the question asks for an aggregate.
+When aggregating data from multiple one-to-many tables, never directly
+join the detail tables and aggregate both sides in the same SELECT.
+Aggregate each detail table separately first, then join the aggregated
+results.
 
-- For product or text searches, NEVER search for the
-  entire multi-word phrase as one ILIKE pattern.
+Avoid double-counting caused by joining multiple transaction-level tables.
 
-- Split the search into individual meaningful keywords.
+## Final Validation
 
-- Search across relevant name and description columns.
+Before returning SQL, verify:
+
+1. It answers the current question.
+2. Conversation references are resolved correctly.
+3. Required filters are present.
+4. The query does not unnecessarily broaden the dataset.
+5. The SQL is valid PostgreSQL.
 
 Database schema:
 
@@ -465,7 +388,11 @@ Database schema:
             (
                 "human",
                 """
-Question:
+Conversation History:
+
+{history}
+
+Current User Question:
 
 {question}
 """,
@@ -475,34 +402,38 @@ Question:
 
     sql_chain = sql_prompt | llm
 
+    history = state.get("messages", [])
+
     raw_sql = sql_chain.invoke(
         {
             "schema": schema_info,
+            "history": history,
             "question": state["query"],
         }
     )
 
-    generated_sql = raw_sql.content
+    generated_sql = raw_sql.content.strip()
 
-    print("========== GENERATED SQL ==========")
-
+    print("======== GENERATED SQL QUERY ========")
     print(generated_sql)
 
-    # ------------------------------------------------------------------------
-    # Execute SQL
-    # ------------------------------------------------------------------------
-
     try:
-
         sql_result = db.run(generated_sql)
-
     except Exception as err:
-
         sql_result = f"Generated SQL execution error: {err}"
 
-    print("========== SQL RESULT ==========")
+    print("========= NL2SQL NODE OUTPUT =========")
+    print("\nSQL Result:")
+    print(str(sql_result))
+    print("======================================")
 
-    print(sql_result)
+    # IMPORTANT:
+    #
+    # Do not return **state here.
+    #
+    # This node can execute in parallel with vector retrieval for HYBRID.
+    # Returning only fields produced by this node avoids unnecessarily
+    # overwriting state produced by the vector branch.
 
     return {
         "generated_sql": generated_sql,
@@ -510,310 +441,617 @@ Question:
     }
 
 
-# ============================================================================
-# Rerank Node
-# ============================================================================
+def route_after_nl2sql(state: RAGState) -> str:
+
+    if state["route"] == "HYBRID":
+        return "HYBRID"
+
+    return "RDBMS"
 
 
-def rerank_node(state: RAGState):
+def rerank_node(state: RAGState) -> RAGState:
 
-    print("========== INSIDE RERANK NODE ==========")
+    print("========= INSIDE RERANK NODE =========")
 
     co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
 
-    docs = state["retrieved_docs"]
-
-    print(f"[rerank_node] Received {len(docs)} documents")
+    docs = state.get("retrieved_docs", [])
 
     if not docs:
-
         print("[rerank_node] No documents to rerank.")
 
-        return {"reranked_docs": []}
+        return {
+            "reranked_docs": [],
+        }
+
+    search_query = state.get("retrieval_query") or state["query"]
+
+    print("======= BEFORE CALLING RERANKER =======")
+    print(f"Search query: {search_query}")
+    print(f"Documents   : {len(docs)}")
 
     rerank_response = co.rerank(
         model="rerank-v3.5",
-        query=state["query"],
+        query=search_query,
         documents=[doc.page_content for doc in docs],
         top_n=5,
     )
 
     reranked_docs = [docs[r.index] for r in rerank_response.results]
 
-    print(f"[rerank_node] Top " f"{len(reranked_docs)} chunks after reranking:")
+    print(f"[rerank_node] Top {len(reranked_docs)} " "chunks after reranking:")
 
     for i, r in enumerate(rerank_response.results):
 
         print(
-            f"Rank {i + 1} | "
-            f"Cohere score: "
-            f"{r.relevance_score:.4f} | "
-            f"Original index: {r.index}"
+            f"  Rank {i + 1} | "
+            f"Cohere score: {r.relevance_score:.4f} | "
+            f"original index: {r.index}"
         )
 
-    return {"reranked_docs": reranked_docs}
+    return {
+        "reranked_docs": reranked_docs,
+    }
 
 
-# ============================================================================
-# Generate Answer Node
-# ============================================================================
+def route_after_rerank(state: RAGState) -> str:
+
+    if state["route"] == "HYBRID":
+        return "HYBRID"
+
+    return "VECTOR_DB"
 
 
-def generate_answer_node(state: RAGState):
+def merge_context_node(state: RAGState) -> RAGState:
+    """
+    Merge SQL results and Vector search results into one context
+    for answer generation.
 
-    print("========== INSIDE GENERATE ANSWER NODE ==========")
+    This node does NOT call an LLM.
+    """
+
+    print("========= INSIDE MERGE CONTEXT NODE =========")
+
+    route = state.get("route")
+
+    # ------------------------------------------------------------------------
+    # SQL CONTEXT
+    # ------------------------------------------------------------------------
+
+    sql_context = ""
+
+    if route in ("RDBMS", "HYBRID") and state.get("sql_result"):
+
+        sql_context = f"""
+==========================
+STRUCTURED CUSTOMER DATA
+==========================
+
+SQL Query Executed:
+{state.get("generated_sql", "")}
+
+SQL Result:
+{state.get("sql_result", "")}
+""".strip()
+
+    # ------------------------------------------------------------------------
+    # VECTOR CONTEXT
+    # ------------------------------------------------------------------------
+
+    vector_context = ""
+
+    if route in ("VECTOR_DB", "HYBRID") and state.get("reranked_docs"):
+
+        vector_chunks = []
+
+        for doc in state["reranked_docs"]:
+
+            source = doc.metadata.get(
+                "source",
+                "Unknown Document",
+            )
+
+            page = doc.metadata.get("page")
+
+            page_no = page + 1 if page is not None else "Unknown"
+
+            vector_chunks.append(f"""
+Source : {source}
+Page   : {page_no}
+
+{doc.page_content}
+""".strip())
+
+        vector_context = (
+            "==========================\n"
+            "KNOWLEDGE BASE\n"
+            "==========================\n\n"
+            + "\n\n----------------------------------------\n\n".join(vector_chunks)
+        )
+
+    contexts = []
+
+    if sql_context:
+        contexts.append(sql_context)
+
+    if vector_context:
+        contexts.append(vector_context)
+
+    final_context = "\n\n".join(contexts)
+
+    print(f"Route                  : {route}")
+    print(f"SQL Context Present    : " f"{bool(sql_context)}")
+    print(f"Vector Context Present : " f"{bool(vector_context)}")
+
+    return {
+        "sql_context": sql_context,
+        "vector_context": vector_context,
+        "final_context": final_context,
+    }
+
+
+def generate_answer_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE GENERATE ANSWER NODE =========")
 
     llm = _get_llm()
 
     structured_llm = llm.with_structured_output(AIResponse)
 
-    route = state["route"]
-
-    # ========================================================================
-    # RDBMS ONLY
-    # ========================================================================
-
-    if route == "RDBMS_ONLY":
-
-        print("[generate_answer_node] RDBMS_ONLY")
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """
-You are a helpful data analyst.
-
-Answer using ONLY the SQL results.
-
-Set:
-
-document_name = "credit_rag_db"
-
-page_no = "N/A"
-
-policy_citations = "N/A"
-
-Never mention SQL unless the user asks.
-""",
-                ),
-                (
-                    "human",
-                    """
-Question:
-
-{query}
-
-SQL Result:
-
-{result}
-""",
-                ),
-            ]
-        )
-
-        chain = prompt | structured_llm
-
-        result = chain.invoke(
-            {
-                "query": state["query"],
-                "result": state["sql_result"],
-            }
-        )
-
-        response = result.model_dump()
-
-        response["sql_query_executed"] = state["generated_sql"]
-
-        return {"response": response}
-
-    # ========================================================================
-    # VECTOR ONLY
-    # ========================================================================
-
-    elif route == "VECTOR_ONLY":
-
-        print("[generate_answer_node] VECTOR_ONLY")
-
-        for doc in state["reranked_docs"]:
-
-            print("Metadata:", doc.metadata)
-
-        context = "\n\n".join(
-            [
-                (
-                    f"[Source: "
-                    f"{doc.metadata.get('source', 'unknown')} "
-                    f"| Page: "
-                    f"{doc.metadata.get('page', -1) + 1 if doc.metadata.get('page') is not None else '?'}]"
-                    f"\n{doc.page_content}"
-                )
-                for doc in state["reranked_docs"]
-            ]
-        )
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """
-You are a helpful assistant.
-
-Answer the user's question using ONLY the
-provided context.
-
-The context may contain chunks from MULTIPLE
-versions of the same document.
-
-When the answer differs across versions:
-
-- Lead with the most recent/current version.
-- Explicitly note how earlier versions differed.
-- If all versions agree, provide the single answer.
-
-Citation rules:
-
-- document_name:
-  comma-separated list of EVERY source document used.
-
-- page_no:
-  comma-separated page numbers aligned with the documents.
-
-- policy_citations:
-  readable citation combining each document and page.
-
-- Always cite ALL versions used.
-""",
-                ),
-                (
-                    "human",
-                    """
-Context:
-
-{context}
-
-Question:
-
-{query}
-""",
-                ),
-            ]
-        )
-
-        chain = prompt | structured_llm
-
-        result = chain.invoke(
-            {
-                "context": context,
-                "query": state["query"],
-            }
-        )
-
-        response = result.model_dump()
-
-        return {"response": response}
-
-    # ========================================================================
-    # HYBRID
-    # ========================================================================
-
-    elif route == "HYBRID":
-
-        print("[generate_answer_node] HYBRID")
-
-        context = "\n\n".join(
-            [
-                (
-                    f"[Source: "
-                    f"{doc.metadata.get('source', 'unknown')} "
-                    f"| Page: "
-                    f"{doc.metadata.get('page', -1) + 1 if doc.metadata.get('page') is not None else '?'}]"
-                    f"\n{doc.page_content}"
-                )
-                for doc in state["reranked_docs"]
-            ]
-        )
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
 You are the NorthStar Credit Card Assistant.
 
-Use document context for:
+Answer the user's question using ONLY the supplied context.
 
-- product rules
-- policies
+The context may contain:
+
+1. STRUCTURED CUSTOMER DATA
+
+This may contain:
+
+- customer information
+- card information
+- transactions
+- spending
+- payments
+- balances
+- reward points
+- transaction history
+- other customer-specific data
+
+2. KNOWLEDGE BASE
+
+This may contain:
+
+- card benefits
+- reward rules
 - fees
-- benefits
 - eligibility
-- knowledge-base information
+- policies
+- billing rules
+- terms and conditions
+- product information
 
-Use database results for:
+Use the source that is relevant to the user's question.
 
-- customer-specific information
-- transactional information
+If both structured customer data and knowledge-base information
+are present and both are relevant, combine them.
 
-Do not invent information missing from either source.
+Do not invent information.
 
-For document-derived claims, populate the structured
-citation fields using the document metadata.
+==================================================
+SOURCE ACCURACY
+==================================================
 
-Document context:
+Answer using only the supplied context.
+
+Preserve the exact meaning and scope of the source.
+
+Do not generalize, infer, or expand policy statements.
+
+If the source says an exclusion applies to a specific portion,
+condition, transaction type, or circumstance, apply the exclusion
+only to that scope.
+
+Do not convert:
+
+"X portion is excluded"
+
+into:
+
+"X is excluded."
+
+Do not convert:
+
+"X transactions are excluded"
+
+into:
+
+"all X spending is excluded."
+
+When a table and an explanatory note appear together, interpret them
+together and preserve both the earning rule and its exceptions.
+
+==================================================
+CONVERSATION
+==================================================
+
+Use conversation history to resolve references such as:
+
+- he
+- she
+- they
+- this customer
+- this card
+- this transaction
+- the same one
+- the previous one
+- what about that
+- how about that
+
+Do not lose entities established in previous turns.
+
+==================================================
+RESPONSE STYLE
+==================================================
+
+- Be concise and business-friendly.
+- Use bullets when useful.
+- Explain numerical results clearly.
+- Do not mention SQL, databases, vector search, retrieval, prompts,
+  internal systems or internal reasoning.
+- Do not expose internal processing details.
+- If the context does not contain enough information to answer,
+  clearly say that the available information is insufficient.
+
+==================================================
+RESPONSE FIELDS
+==================================================
+
+Populate:
+
+- answer
+- document_name
+- page_no
+- policy_citations
+- sql_query_executed
+
+For database-only answers:
+
+- document_name may be empty.
+- page_no may be empty.
+- policy_citations may be empty.
+
+For knowledge-base answers:
+
+- populate document_name and page_no when available.
+- populate policy_citations when appropriate.
+
+For HYBRID answers:
+
+- populate both database-related and document-related fields
+  when applicable.
+""",
+            ),
+            (
+                "human",
+                """
+Conversation History:
+
+{history}
+
+Current User Question:
+
+{query}
+
+Retrieved Context:
 
 {context}
 
-Database result:
+Previous Evaluation Feedback (if any):
 
-{sql_result}
-
-Combine both sources and answer the user.
+{feedback}
 """,
-                ),
-                ("human", "{query}"),
-            ]
-        )
+            ),
+        ]
+    )
 
-        chain = prompt | structured_llm
+    chain = prompt | structured_llm
 
-        result = chain.invoke(
-            {
-                "context": context,
-                "sql_result": state["sql_result"],
-                "query": state["query"],
-            }
-        )
+    history = state.get("messages", [])
 
-        response = result.model_dump()
+    result = chain.invoke(
+        {
+            "query": state["query"],
+            "context": state.get("final_context", ""),
+            "history": history,
+            "feedback": state.get(
+                "evaluation_feedback",
+                "",
+            ),
+        }
+    )
 
+    response = result.model_dump()
+
+    # Preserve the SQL query generated during this turn.
+    #
+    # This is useful for RDBMS and HYBRID responses.
+    if state.get("generated_sql"):
         response["sql_query_executed"] = state["generated_sql"]
 
-        return {"response": response}
+    print("[generate_answer_node] Answer generated.")
 
-    # ========================================================================
-    # Unexpected route
-    # ========================================================================
-
-    else:
-
-        raise ValueError(f"Unsupported route: {route}")
+    return {
+        "response": response,
+    }
 
 
-# ============================================================================
-# Hybrid Start Node
-# ============================================================================
+def evaluate_answer_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE EVALUATE ANSWER NODE =========")
+
+    print("========= ANSWER BEING EVALUATED =========")
+    print(state["response"])
+
+    evaluate_count = state.get("evaluate_count", 0) + 1
+
+    print(f"Evaluation attempt number: " f"{evaluate_count}")
+
+    llm = _get_evaluator_llm()
+
+    structured_llm = llm.with_structured_output(EvaluationDecision)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+You are the answer evaluator for a credit-card RAG system.
+
+Evaluate the generated answer against the retrieved context.
+
+PASS if:
+
+1. The answer is supported by the retrieved context.
+2. The answer does not contradict the retrieved context.
+3. Important qualifiers, conditions, exceptions and scope are preserved.
+4. The answer directly addresses the user's question.
+
+REGENERATE if:
+
+1. The answer contradicts the retrieved context.
+2. The answer makes an unsupported claim.
+3. The answer omits a condition that materially changes the meaning.
+4. The answer fails to answer the question.
+
+IMPORTANT:
+
+Use only the retrieved context as the factual authority.
+
+Do not substitute general knowledge for retrieved information.
+
+Do not broaden or narrow the scope of a policy statement.
+
+Evaluate strictly against the retrieved context and preserve the exact
+scope of qualifiers, conditions and exceptions.
+
+Do not broaden a specific exclusion into a broader exclusion.
+
+The evaluator must not blindly trust numerical results produced by SQL.
+Check for obvious aggregation inconsistencies, duplicated counts,
+conflicting metrics, or misuse of fields when the retrieved context
+contains enough information to identify the correct metric.
+
+Preserve qualifiers such as:
+
+- only
+- except
+- portion
+- subject to
+- up to
+- minimum
+- maximum
+- per transaction
+- per statement
+- per month
+- per year
+
+When the source contains a specific exception, preserve that exception
+rather than generalizing it to the entire category.
+""",
+            ),
+            (
+                "human",
+                """
+Conversation History:
+
+{history}
+
+Current Question:
+
+{query}
+
+Retrieved Context:
+
+{context}
+
+Generated Answer:
+
+{answer}
+
+Previous Evaluation Feedback:
+
+{feedback}
+""",
+            ),
+        ]
+    )
+
+    chain = prompt | structured_llm
+
+    history = state.get("messages", [])
+
+    answer = state.get(
+        "response",
+        {},
+    ).get(
+        "answer",
+        "",
+    )
+
+    print("========= ANSWER SENT TO EVALUATOR =========")
+    print(answer)
+
+    result = chain.invoke(
+        {
+            "query": state["query"],
+            "context": state.get(
+                "final_context",
+                "",
+            ),
+            "history": history,
+            "answer": answer,
+            "feedback": state.get(
+                "evaluation_feedback",
+                "",
+            ),
+        }
+    )
+
+    print("========= EVALUATOR RESULT =========")
+    print(f"[evaluate_answer_node] " f"{result.evaluation}")
+    print(result)
+
+    # ----------------------------------------------------------
+    # Only persist the assistant answer when evaluation is final.
+    #
+    # If evaluation #1 says REGENERATE, do NOT add the answer
+    # to conversation history because it will be replaced.
+    #
+    # If evaluation PASSes, or evaluation #2 fails and we stop,
+    # the current answer becomes the final answer for this turn.
+    # ----------------------------------------------------------
+
+    update = {
+        "evaluation": result.evaluation,
+        "evaluation_feedback": result.feedback,
+        "evaluate_count": evaluate_count,
+    }
+
+    is_final_answer = result.evaluation == "PASS" or evaluate_count >= 2
+
+    if is_final_answer:
+
+        answer = state.get("response", {}).get("answer", "")
+
+        if answer:
+            update["messages"] = [AIMessage(content=answer)]
+
+    return update
 
 
-def hybrid_start_node(state: RAGState):
+def should_reformulate_after_search(
+    state: RAGState,
+) -> bool:
 
-    print("========== INSIDE HYBRID START NODE ==========")
+    docs = state.get(
+        "retrieved_docs",
+        [],
+    )
 
+    attempt = state.get(
+        "retrieval_attempt",
+        0,
+    )
+
+    # Never reformulate more than once.
+    if attempt >= 2:
+        return False
+
+    # No results.
+    if not docs:
+
+        print("[retrieval_quality] " "No documents found. Reformulating query.")
+
+        return True
+
+    similarity_threshold = 0.50
+
+    relevant_docs = [
+        doc
+        for doc in docs
+        if (
+            doc.metadata.get("similarity") is not None
+            and doc.metadata.get("similarity") >= similarity_threshold
+        )
+    ]
+
+    top_similarity = docs[0].metadata.get("similarity")
+
+    print(
+        "[retrieval_quality] "
+        f"Top similarity: {top_similarity} | "
+        f"Relevant docs: {len(relevant_docs)} | "
+        f"Attempt: {attempt}"
+    )
+
+    if len(relevant_docs) < 3:
+
+        print(
+            "[retrieval_quality] " "Retrieval quality is low. " "Reformulating query."
+        )
+
+        return True
+
+    print(
+        "[retrieval_quality] "
+        "Retrieval quality is sufficient. "
+        "Skipping reformulation."
+    )
+
+    return False
+
+
+def route_after_vector_search(
+    state: RAGState,
+) -> str:
+
+    if should_reformulate_after_search(state):
+        return "REFORMULATE"
+
+    return "CONTINUE"
+
+
+def route_after_evaluation(
+    state: RAGState,
+) -> str:
+
+    if state.get("evaluation") == "PASS":
+        return "PASS"
+
+    if state.get("evaluate_count", 0) == 1:
+        return "REGENERATE"
+
+    return "END"
+
+
+def hybrid_vector_done_node(state: RAGState) -> RAGState:
+    print("========= HYBRID VECTOR BRANCH COMPLETE =========")
+    return {}
+
+
+def hybrid_sql_done_node(state: RAGState) -> RAGState:
+    print("========= HYBRID SQL BRANCH COMPLETE =========")
     return {}
 
 
 # ============================================================================
-# Build RAG Graph
+# BUILD RAG GRAPH
 # ============================================================================
 
 
@@ -826,111 +1064,108 @@ def build_rag_graph():
     # ------------------------------------------------------------------------
 
     workflow.add_node("router", router_node)
-
-    workflow.add_node("nl2sql", nl2sql_node)
-
-    workflow.add_node("vector_search", vector_search_node)
-
-    workflow.add_node("rerank", rerank_node)
-
-    workflow.add_node("generate_answer", generate_answer_node)
-
     workflow.add_node("hybrid_start", hybrid_start_node)
-
-    # ------------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------------
+    workflow.add_node("hybrid_join", hybrid_join_node)
+    workflow.add_node("hybrid_vector_done", hybrid_vector_done_node)
+    workflow.add_node("hybrid_sql_done", hybrid_sql_done_node)
+    workflow.add_node("nl2sql", nl2sql_node)
+    workflow.add_node("vector_search", vector_search_node)
+    workflow.add_node("query_reformulation", query_reformulation_node)
+    workflow.add_node("rerank", rerank_node)
+    workflow.add_node("merge_context", merge_context_node)
+    workflow.add_node("generate_answer", generate_answer_node)
+    workflow.add_node("evaluate_answer", evaluate_answer_node)
 
     workflow.set_entry_point("router")
-
-    # ------------------------------------------------------------------------
-    # Router -> Route
-    # ------------------------------------------------------------------------
-    #
-    # CHITCHAT goes directly to END.
-    #
-    # It does NOT execute:
-    #
-    # vector_search
-    # rerank
-    # nl2sql
-    # hybrid_start
-    # generate_answer
-    #
-    # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
         "router",
         lambda state: state["route"],
         {
-            "CHITCHAT": END,
-            "VECTOR_ONLY": "vector_search",
-            "RDBMS_ONLY": "nl2sql",
+            "VECTOR_DB": "vector_search",
+            "RDBMS": "nl2sql",
             "HYBRID": "hybrid_start",
+            "DIRECT": END,
         },
     )
 
-    # ------------------------------------------------------------------------
-    # Vector path
-    # ------------------------------------------------------------------------
-
-    workflow.add_edge("vector_search", "rerank")
-
-    workflow.add_conditional_edges(
-        "rerank",
-        lambda state: state["route"],
-        {
-            "VECTOR_ONLY": "generate_answer",
-            "HYBRID": "generate_answer",
-        },
-    )
-
-    # ------------------------------------------------------------------------
-    # SQL path
-    # ------------------------------------------------------------------------
+    workflow.add_edge("hybrid_start", "vector_search")
+    workflow.add_edge("hybrid_start", "nl2sql")
 
     workflow.add_conditional_edges(
         "nl2sql",
-        lambda state: state["route"],
+        route_after_nl2sql,
         {
-            "RDBMS_ONLY": "generate_answer",
-            "HYBRID": "generate_answer",
+            "RDBMS": "merge_context",
+            "HYBRID": "hybrid_sql_done",
+        },
+    )
+
+    workflow.add_conditional_edges(
+        "vector_search",
+        route_after_vector_search,
+        {
+            "REFORMULATE": "query_reformulation",
+            "CONTINUE": "rerank",
+        },
+    )
+
+    workflow.add_conditional_edges(
+        "rerank",
+        route_after_rerank,
+        {
+            "VECTOR_DB": "merge_context",
+            "HYBRID": "hybrid_vector_done",
+        },
+    )
+
+    workflow.add_edge("query_reformulation", "vector_search")
+    workflow.add_edge(["hybrid_vector_done", "hybrid_sql_done"], "hybrid_join")
+    workflow.add_edge("hybrid_join", "merge_context")
+    workflow.add_edge("merge_context", "generate_answer")
+    workflow.add_edge("generate_answer", "evaluate_answer")
+
+    # ------------------------------------------------------------------------
+    # EVALUATION
+    # ------------------------------------------------------------------------
+
+    workflow.add_conditional_edges(
+        "evaluate_answer",
+        route_after_evaluation,
+        {
+            "PASS": END,
+            "REGENERATE": "generate_answer",
+            "END": END,
         },
     )
 
     # ------------------------------------------------------------------------
-    # Hybrid path
-    # ------------------------------------------------------------------------
-
-    workflow.add_edge("hybrid_start", "vector_search")
-
-    workflow.add_edge("hybrid_start", "nl2sql")
-
-    # ------------------------------------------------------------------------
-    # Final node
-    # ------------------------------------------------------------------------
-
-    workflow.add_edge("generate_answer", END)
-
-    # ------------------------------------------------------------------------
-    # Checkpointer
+    # CHECKPOINT
     # ------------------------------------------------------------------------
 
     memory = InMemorySaver()
 
-    search_agent = workflow.compile(checkpointer=memory)
+    search_agent = workflow.compile(
+        checkpointer=memory,
+    )
 
     # ------------------------------------------------------------------------
-    # Generate graph visualization
+    # GRAPH VISUALIZATION
     # ------------------------------------------------------------------------
 
     try:
 
         graph_image = search_agent.get_graph().draw_mermaid_png()
 
-        with open("search_agent.png", "wb") as f:
-
+        with open(
+            "credit_card_spend_summarization_agent.png",
+            "wb",
+        ) as f:
             f.write(graph_image)
+
+        print(
+            "Graph visualization saved to " "credit_card_spend_summarization_agent.png"
+        )
 
     except Exception as exc:
 
@@ -940,61 +1175,52 @@ def build_rag_graph():
 
 
 # ============================================================================
-# Build graph once
+# CREATE GRAPH
 # ============================================================================
 
 rag_graph = build_rag_graph()
 
 
 # ============================================================================
-# Run Search Agent
+# PUBLIC ENTRY POINT
 # ============================================================================
 
 
-def run_search_agent(query: str, thread_id: str | None = None):
+def run_search_agent(
+    query: str,
+    thread_id: str,
+):
 
     print("============ INSIDE run_search_agent ============")
 
-    normalized_thread_id = thread_id or "default-thread"
-
-    print(f"[run_search_agent] " f"thread_id={normalized_thread_id}")
-
-    # ------------------------------------------------------------------------
-    # Initial state
-    # ------------------------------------------------------------------------
-    #
-    # No conversational state is required.
-    #
-    # The router itself handles CHITCHAT.
-    # ------------------------------------------------------------------------
-
     initial_state = {
         "query": query,
+        "messages": [HumanMessage(content=query)],
         "route": "",
+        "retrieval_query": "",
+        "retrieval_attempt": 0,
         "retrieved_docs": [],
         "reranked_docs": [],
         "generated_sql": "",
         "sql_result": "",
+        "sql_context": "",
+        "vector_context": "",
+        "final_context": "",
         "response": {},
+        "evaluation": "",
+        "evaluation_feedback": "",
+        "evaluate_count": 0,
     }
 
-    # ------------------------------------------------------------------------
-    # Checkpoint configuration
-    # ------------------------------------------------------------------------
-
-    config = {"configurable": {"thread_id": normalized_thread_id}}
-
-    # ------------------------------------------------------------------------
-    # Invoke graph
-    # ------------------------------------------------------------------------
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+        }
+    }
 
     final_state = rag_graph.invoke(
         initial_state,
         config=config,
     )
-
-    print("============ AGENT COMPLETED ============")
-
-    print("[run_search_agent] Final route:", final_state.get("route"))
 
     return final_state["response"]
