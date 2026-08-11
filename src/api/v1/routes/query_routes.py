@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from src.api.v1.schemas.query_schema import QueryRequest, QueryResponse
 from src.api.v1.services.query_service import query_documents, query_documents_stream
 from fastapi.responses import StreamingResponse
+
 from src.core.db import EmbeddingServiceError
 
 router = APIRouter(prefix="/api/v1/query")
@@ -36,7 +37,6 @@ def query_endpoint(request: QueryRequest) -> QueryResponse:
             status_code=500,
             detail="Unable to process the query.",
         ) from exc
-
 
 # for streaming response
 @router.post("/stream")
