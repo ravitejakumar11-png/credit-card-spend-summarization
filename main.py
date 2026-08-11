@@ -1,13 +1,31 @@
 from fastapi import FastAPI
 from src.api.v1.routes import query_routes
 from src.api.v1.routes import upload_routes
+from contextlib import asynccontextmanager
+from src.core.db import validate_embedding_service
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    print("========== APPLICATION STARTUP ==========")
+
+    validate_embedding_service()
+
+    print("========== APPLICATION STARTUP COMPLETE ==========")
+
+    yield
+
+
+app = FastAPI(
+    title="NorthStar Credit Card Assistant",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "NorthStar Credit Card Assistant"}
 
 
 @app.get("/health")
