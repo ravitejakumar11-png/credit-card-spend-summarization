@@ -1,17 +1,24 @@
+import json
 import uuid
+import queue
+
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import streamlit as st
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Configuration
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 API_BASE_URL = "http://127.0.0.1:8000"
 
-# ---------------------------------------------------------------------------
+_QUERY_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+
+
+# ============================================================================
 # Page configuration
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 st.set_page_config(
     page_title="NorthStar Credit Card Assistant",
@@ -21,23 +28,50 @@ st.set_page_config(
 
 st.title("NorthStar Credit Card Assistant")
 
-# ---------------------------------------------------------------------------
-# Create conversation thread
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# Conversation thread
+# ============================================================================
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 
-# ---------------------------------------------------------------------------
+
+# ============================================================================
 # Chat history
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# Query execution state
+# ============================================================================
+
+if "query_running" not in st.session_state:
+    st.session_state.query_running = False
+
+if "active_query" not in st.session_state:
+    st.session_state.active_query = None
+
+if "query_future" not in st.session_state:
+    st.session_state.query_future = None
+
+if "query_cancel_requested" not in st.session_state:
+    st.session_state.query_cancel_requested = False
+
+if "query_error" not in st.session_state:
+    st.session_state.query_error = None
+
+if "query_progress" not in st.session_state:
+    st.session_state.query_progress = None
+
+if "query_progress_queue" not in st.session_state:
+    st.session_state.query_progress_queue = None
+# ============================================================================
 # Delete / Clear / Ingestion state
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 if "confirm_delete_doc_id" not in st.session_state:
     st.session_state.confirm_delete_doc_id = None
@@ -54,9 +88,10 @@ if "confirm_clear_all" not in st.session_state:
 if "clear_message" not in st.session_state:
     st.session_state.clear_message = None
 
-# ---------------------------------------------------------------------------
+
+# ============================================================================
 # Ingestion result state
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 if "ingest_message" not in st.session_state:
     st.session_state.ingest_message = None
@@ -64,9 +99,166 @@ if "ingest_message" not in st.session_state:
 if "ingest_result" not in st.session_state:
     st.session_state.ingest_result = None
 
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# Background query worker
+# ============================================================================
+
+
+def _execute_query_request(
+    query: str,
+    thread_id: str,
+    progress_queue: queue.Queue,
+) -> dict:
+
+    print("========== BACKGROUND QUERY WORKER ==========")
+
+    print(f"Query     : {query!r}")
+
+    print(f"Thread ID : {thread_id!r}")
+
+    try:
+
+        with requests.post(
+            f"{API_BASE_URL}/api/v1/query/stream",
+            json={
+                "query": query,
+                "thread_id": thread_id,
+            },
+            stream=True,
+            timeout=300,
+        ) as response:
+
+            print("========== STREAMING API RESPONSE ==========")
+
+            print(f"Status code : {response.status_code}")
+
+            if not response.ok:
+
+                return {
+                    "status": "error",
+                    "error": (
+                        f"API request failed: "
+                        f"{response.status_code} - "
+                        f"{response.text}"
+                    ),
+                }
+
+            # IMPORTANT:
+            # chunk_size=1 helps small NDJSON progress events arrive
+            # without unnecessary buffering.
+            for line in response.iter_lines(
+                chunk_size=1,
+                decode_unicode=True,
+            ):
+
+                if not line:
+                    continue
+
+                try:
+
+                    event = json.loads(line)
+
+                except json.JSONDecodeError:
+
+                    print("[query_worker] " "Ignoring invalid stream event.")
+
+                    continue
+
+                event_type = event.get("event")
+
+                # ============================================================
+                # PROGRESS EVENT
+                # ============================================================
+
+                if event_type == "progress":
+
+                    message = event.get(
+                        "message",
+                        "",
+                    )
+
+                    if message:
+
+                        print("[query_worker] Progress: " f"{message}")
+
+                        # Send progress to the Streamlit fragment.
+                        progress_queue.put(message)
+
+                    continue
+
+                # ============================================================
+                # FINAL RESPONSE
+                # ============================================================
+
+                if event_type == "final":
+
+                    return {
+                        "status": "success",
+                        "response": event.get("data"),
+                    }
+
+                # ============================================================
+                # CANCELLATION
+                # ============================================================
+
+                if event_type == "cancelled":
+
+                    return {
+                        "status": "cancelled",
+                        "message": event.get(
+                            "message",
+                            "The query was stopped.",
+                        ),
+                    }
+
+                # ============================================================
+                # BACKEND ERROR
+                # ============================================================
+
+                if event_type == "error":
+
+                    return {
+                        "status": "error",
+                        "error": event.get(
+                            "message",
+                            "Unable to process your question.",
+                        ),
+                    }
+
+            return {
+                "status": "error",
+                "error": (
+                    "The server ended the request "
+                    "without returning a final response."
+                ),
+            }
+
+    except requests.RequestException as exc:
+
+        print("[query_worker] Request failed: " f"{exc}")
+
+        return {
+            "status": "error",
+            "error": ("Could not connect to the FastAPI server. " "Please try again."),
+        }
+
+    except Exception as exc:
+
+        print("[query_worker] Unexpected error: " f"{exc}")
+
+        return {
+            "status": "error",
+            "error": (
+                "Something went wrong while processing "
+                "your question. Please try again."
+            ),
+        }
+
+
+# ============================================================================
 # Developer Mode Sidebar
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 with st.sidebar:
 
@@ -81,35 +273,22 @@ with st.sidebar:
 
         st.divider()
 
-        # ================================================================
+        # ====================================================================
         # Document Ingestion
-        # ================================================================
+        # ====================================================================
 
         st.subheader("Document Ingestion")
 
-        # ---------------------------------------------------------------
-        # Display previous ingestion result
-        # ---------------------------------------------------------------
-
         if st.session_state.ingest_message:
 
-            st.success(
-                st.session_state.ingest_message
-            )
+            st.success(st.session_state.ingest_message)
 
             if st.session_state.ingest_result:
 
-                st.json(
-                    st.session_state.ingest_result
-                )
+                st.json(st.session_state.ingest_result)
 
-            # Clear the persisted result after displaying it.
             st.session_state.ingest_message = None
             st.session_state.ingest_result = None
-
-        # ---------------------------------------------------------------
-        # File upload
-        # ---------------------------------------------------------------
 
         uploaded_file = st.file_uploader(
             "Upload PDF or DOCX",
@@ -124,9 +303,7 @@ with st.sidebar:
 
             try:
 
-                with st.spinner(
-                    "Uploading and ingesting document..."
-                ):
+                with st.spinner("Uploading and ingesting document..."):
 
                     response = requests.post(
                         f"{API_BASE_URL}/api/v1/upload/",
@@ -144,13 +321,7 @@ with st.sidebar:
 
                     result = response.json()
 
-                    # ---------------------------------------------------
-                    # Persist ingestion response before rerun.
-                    # ---------------------------------------------------
-
-                    st.session_state.ingest_message = (
-                        "Document ingested successfully."
-                    )
+                    st.session_state.ingest_message = "Document ingested successfully."
 
                     st.session_state.ingest_result = result
 
@@ -166,45 +337,31 @@ with st.sidebar:
 
             except requests.RequestException as exc:
 
-                st.error(
-                    f"Could not connect to the FastAPI server: {exc}"
-                )
+                st.error(f"Could not connect to the FastAPI server: {exc}")
 
         st.divider()
 
-        # ================================================================
+        # ====================================================================
         # Knowledge Base
-        # ================================================================
+        # ====================================================================
 
         st.subheader("Knowledge Base")
 
-        # ---------------------------------------------------------------
-        # Display individual document deletion message
-        # ---------------------------------------------------------------
-
         if st.session_state.delete_message:
 
-            st.success(
-                st.session_state.delete_message
-            )
+            st.success(st.session_state.delete_message)
 
             st.session_state.delete_message = None
 
-        # ---------------------------------------------------------------
-        # Display clear-all success message
-        # ---------------------------------------------------------------
-
         if st.session_state.clear_message:
 
-            st.success(
-                st.session_state.clear_message
-            )
+            st.success(st.session_state.clear_message)
 
             st.session_state.clear_message = None
 
-        # ---------------------------------------------------------------
-        # Get currently ingested documents
-        # ---------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # Load documents
+        # --------------------------------------------------------------------
 
         documents = []
 
@@ -236,21 +393,18 @@ with st.sidebar:
 
         except requests.RequestException as exc:
 
-            st.error(
-                f"Could not connect to the FastAPI server: {exc}"
-            )
+            st.error(f"Could not connect to the FastAPI server: {exc}")
 
-        # ---------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Delete individual document
-        # ---------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         st.markdown("**Delete Document**")
 
         if documents:
 
             document_options = {
-                document["filename"]: document
-                for document in documents
+                document["filename"]: document for document in documents
             }
 
             selected_filename = st.selectbox(
@@ -258,30 +412,15 @@ with st.sidebar:
                 options=list(document_options.keys()),
             )
 
-            selected_document = document_options[
-                selected_filename
-            ]
+            selected_document = document_options[selected_filename]
 
-            selected_doc_id = str(
-                selected_document["id"]
-            )
+            selected_doc_id = str(selected_document["id"])
 
-            st.caption(
-                f"Document ID: {selected_doc_id}"
-            )
-
-            # -----------------------------------------------------------
-            # Check whether this document is awaiting confirmation
-            # -----------------------------------------------------------
+            st.caption(f"Document ID: {selected_doc_id}")
 
             confirmation_active = (
-                st.session_state.confirm_delete_doc_id
-                == selected_doc_id
+                st.session_state.confirm_delete_doc_id == selected_doc_id
             )
-
-            # -----------------------------------------------------------
-            # Normal delete button
-            # -----------------------------------------------------------
 
             if not confirmation_active:
 
@@ -290,19 +429,11 @@ with st.sidebar:
                     use_container_width=True,
                 ):
 
-                    st.session_state.confirm_delete_doc_id = (
-                        selected_doc_id
-                    )
+                    st.session_state.confirm_delete_doc_id = selected_doc_id
 
-                    st.session_state.confirm_delete_filename = (
-                        selected_filename
-                    )
+                    st.session_state.confirm_delete_filename = selected_filename
 
                     st.rerun()
-
-            # -----------------------------------------------------------
-            # Confirmation section
-            # -----------------------------------------------------------
 
             if confirmation_active:
 
@@ -315,10 +446,6 @@ with st.sidebar:
 
                 confirm_col, cancel_col = st.columns(2)
 
-                # -------------------------------------------------------
-                # Confirm deletion
-                # -------------------------------------------------------
-
                 with confirm_col:
 
                     if st.button(
@@ -326,19 +453,13 @@ with st.sidebar:
                         use_container_width=True,
                     ):
 
-                        doc_id_to_delete = (
-                            st.session_state.confirm_delete_doc_id
-                        )
+                        doc_id_to_delete = st.session_state.confirm_delete_doc_id
 
-                        filename_to_delete = (
-                            st.session_state.confirm_delete_filename
-                        )
+                        filename_to_delete = st.session_state.confirm_delete_filename
 
                         try:
 
-                            with st.spinner(
-                                "Deleting document..."
-                            ):
+                            with st.spinner("Deleting document..."):
 
                                 response = requests.delete(
                                     f"{API_BASE_URL}/api/v1/upload/"
@@ -369,13 +490,8 @@ with st.sidebar:
                         except requests.RequestException as exc:
 
                             st.error(
-                                "Could not connect to the "
-                                f"FastAPI server: {exc}"
+                                "Could not connect to the " f"FastAPI server: {exc}"
                             )
-
-                # -------------------------------------------------------
-                # Cancel deletion
-                # -------------------------------------------------------
 
                 with cancel_col:
 
@@ -391,15 +507,13 @@ with st.sidebar:
 
         else:
 
-            st.info(
-                "No documents are currently ingested."
-            )
+            st.info("No documents are currently ingested.")
 
         st.divider()
 
-        # ================================================================
-        # Clear All Ingested Data
-        # ================================================================
+        # ====================================================================
+        # Clear All
+        # ====================================================================
 
         st.subheader("Clear Knowledge Base")
 
@@ -407,10 +521,6 @@ with st.sidebar:
             "Clearing the knowledge base will delete all "
             "ingested documents, chunks and extracted images."
         )
-
-        # ---------------------------------------------------------------
-        # Initial Clear All button
-        # ---------------------------------------------------------------
 
         if not st.session_state.confirm_clear_all:
 
@@ -423,10 +533,6 @@ with st.sidebar:
 
                 st.rerun()
 
-        # ---------------------------------------------------------------
-        # Clear All confirmation
-        # ---------------------------------------------------------------
-
         if st.session_state.confirm_clear_all:
 
             st.error(
@@ -437,10 +543,6 @@ with st.sidebar:
 
             clear_confirm_col, clear_cancel_col = st.columns(2)
 
-            # -----------------------------------------------------------
-            # Confirm Clear All
-            # -----------------------------------------------------------
-
             with clear_confirm_col:
 
                 if st.button(
@@ -450,9 +552,7 @@ with st.sidebar:
 
                     try:
 
-                        with st.spinner(
-                            "Clearing ingested data..."
-                        ):
+                        with st.spinner("Clearing ingested data..."):
 
                             response = requests.delete(
                                 f"{API_BASE_URL}/api/v1/upload/clear",
@@ -461,22 +561,10 @@ with st.sidebar:
 
                         if response.ok:
 
-                            # ------------------------------------------------
-                            # Clear confirmation state
-                            # ------------------------------------------------
-
                             st.session_state.confirm_clear_all = False
-
-                            # ------------------------------------------------
-                            # Clear individual deletion state
-                            # ------------------------------------------------
 
                             st.session_state.confirm_delete_doc_id = None
                             st.session_state.confirm_delete_filename = None
-
-                            # ------------------------------------------------
-                            # Persist clear success message
-                            # ------------------------------------------------
 
                             st.session_state.clear_message = (
                                 "All ingested data has been cleared successfully."
@@ -499,13 +587,8 @@ with st.sidebar:
                         st.session_state.confirm_clear_all = False
 
                         st.error(
-                            "Could not connect to the "
-                            f"FastAPI server: {exc}"
+                            "Could not connect to the " f"{API_BASE_URL} server: {exc}"
                         )
-
-            # -----------------------------------------------------------
-            # Cancel Clear All
-            # -----------------------------------------------------------
 
             with clear_cancel_col:
 
@@ -518,9 +601,14 @@ with st.sidebar:
 
                     st.rerun()
 
-# ---------------------------------------------------------------------------
-# Display previous chat messages
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# Display chat history
+#
+# IMPORTANT:
+# The final answer is persisted here BEFORE the full rerun.
+# This is what prevents the answer from disappearing.
+# ============================================================================
 
 for message in st.session_state.chat_history:
 
@@ -528,55 +616,231 @@ for message in st.session_state.chat_history:
 
         st.write(message["content"])
 
-# ---------------------------------------------------------------------------
-# User input
-# ---------------------------------------------------------------------------
 
-if query := st.chat_input(
-    "Ask your credit card question..."
-):
+# ============================================================================
+# Active query fragment
+#
+# IMPORTANT:
+# This fragment NEVER permanently renders the final answer.
+#
+# Its only responsibilities are:
+#
+#   1. Show that processing is happening.
+#   2. Show the Stop button.
+#   3. Monitor the background request.
+#   4. Persist the final result.
+#   5. Trigger a full rerun.
+#
+# The normal chat-history section above then displays the answer.
+# ============================================================================
 
-    # -----------------------------------------------------------------------
-    # Display user message
-    # -----------------------------------------------------------------------
 
-    st.session_state.chat_history.append(
-        {
-            "role": "user",
-            "content": query,
-        }
-    )
+@st.fragment(run_every="1s")
+def active_query_fragment():
 
-    with st.chat_message("user"):
+    if not st.session_state.query_running:
 
-        st.write(query)
+        return
 
-    # -----------------------------------------------------------------------
-    # Call FastAPI query endpoint
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Read progress events produced by the background query worker.
+    # ------------------------------------------------------------------------
+
+    progress_queue = st.session_state.query_progress_queue
+
+    if progress_queue is not None:
+
+        latest_progress = None
+
+        while True:
+
+            try:
+
+                latest_progress = progress_queue.get_nowait()
+
+            except queue.Empty:
+
+                break
+
+        if latest_progress:
+
+            st.session_state.query_progress = latest_progress
+    # ------------------------------------------------------------------------
+    # Processing indicator
+    # ------------------------------------------------------------------------
+
+    if st.session_state.query_cancel_requested:
+
+        st.info("Stopping your request...")
+
+    else:
+
+        progress_message = (
+            st.session_state.query_progress or "Processing your question..."
+        )
+
+        st.info(progress_message)
+
+    # ------------------------------------------------------------------------
+    # Stop button
+    # ------------------------------------------------------------------------
+
+    if st.session_state.query_cancel_requested:
+
+        st.button(
+            "⏹ Stopping...",
+            disabled=True,
+            use_container_width=True,
+        )
+
+    else:
+
+        if st.button(
+            "⏹ Stop",
+            use_container_width=True,
+        ):
+
+            print("========== QUERY CANCELLATION REQUEST ==========")
+
+            print(f"Thread ID : " f"{st.session_state.thread_id!r}")
+
+            try:
+
+                response = requests.post(
+                    f"{API_BASE_URL}/api/v1/query/cancel/"
+                    f"{st.session_state.thread_id}",
+                    timeout=10,
+                )
+
+                if response.ok:
+
+                    print("[ui] Cancellation requested.")
+
+                    st.session_state.query_cancel_requested = True
+
+                    st.rerun()
+
+                else:
+
+                    st.error(
+                        "Unable to stop the query: "
+                        f"{response.status_code} - "
+                        f"{response.text}"
+                    )
+
+            except requests.RequestException as exc:
+
+                st.error("Could not connect to the " f"{API_BASE_URL} server: {exc}")
+
+    # ------------------------------------------------------------------------
+    # Get background future
+    # ------------------------------------------------------------------------
+
+    future = st.session_state.query_future
+
+    if future is None:
+
+        st.session_state.query_running = False
+
+        st.session_state.query_error = "The query could not be started."
+
+        st.rerun()
+
+    # ------------------------------------------------------------------------
+    # Query is still running
+    # ------------------------------------------------------------------------
+
+    if not future.done():
+
+        return
+
+    # ------------------------------------------------------------------------
+    # Query has completed
+    # ------------------------------------------------------------------------
 
     try:
 
-        with st.chat_message("assistant"):
+        result = future.result()
 
-            with st.spinner("Thinking..."):
+    except Exception as exc:
 
-                response = requests.post(
-                    f"{API_BASE_URL}/api/v1/query/",
-                    json={
-                        "query": query,
-                        "thread_id": st.session_state.thread_id,
-                    },
-                    timeout=300,
-                )
+        print("[ui] Background query failed: " f"{exc}")
 
-            if response.ok:
+        result = {
+            "status": "error",
+            "error": (
+                "Something went wrong while processing "
+                "your question. Please try again."
+            ),
+        }
 
-                result = response.json()
+    # ------------------------------------------------------------------------
+    # Capture cancellation state BEFORE resetting it.
+    # ------------------------------------------------------------------------
 
-                answer = result["answer"]
+    was_cancel_requested = st.session_state.query_cancel_requested
 
-                st.write(answer)
+    # ------------------------------------------------------------------------
+    # Clear active query state.
+    # ------------------------------------------------------------------------
+
+    st.session_state.query_running = False
+
+    st.session_state.query_future = None
+
+    st.session_state.active_query = None
+
+    st.session_state.query_cancel_requested = False
+
+    st.session_state.query_progress = None
+
+    st.session_state.query_progress_queue = None
+
+    # ------------------------------------------------------------------------
+    # If user pressed Stop, do not display the eventual answer.
+    # ------------------------------------------------------------------------
+
+    if was_cancel_requested:
+
+        stop_message = "The query was stopped."
+
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "content": stop_message,
+            }
+        )
+
+        # Full rerun:
+        #
+        # - active fragment disappears
+        # - chat input becomes enabled
+        # - stop message appears in chat history
+
+        st.rerun()
+
+    # ------------------------------------------------------------------------
+    # Successful response
+    # ------------------------------------------------------------------------
+
+    if result.get("status") == "success":
+
+        final_response = result.get("response")
+
+        if final_response:
+
+            answer = final_response.get(
+                "answer",
+                "",
+            )
+
+            if answer:
+
+                # ------------------------------------------------------------
+                # IMPORTANT:
+                #
+                # Persist the answer BEFORE rerunning.
+                # ------------------------------------------------------------
 
                 st.session_state.chat_history.append(
                     {
@@ -587,34 +851,139 @@ if query := st.chat_input(
 
             else:
 
-                error_message = (
-                    f"API request failed: "
-                    f"{response.status_code} - "
-                    f"{response.text}"
-                )
-
-                st.error(error_message)
-
                 st.session_state.chat_history.append(
                     {
                         "role": "assistant",
-                        "content": error_message,
+                        "content": (
+                            "The assistant could not produce "
+                            "a response. Please try again."
+                        ),
                     }
                 )
 
-    except requests.RequestException as exc:
+        else:
 
-        error_message = (
-            f"Could not connect to the FastAPI server: {exc}"
-        )
+            st.session_state.chat_history.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "The assistant did not return a response. " "Please try again."
+                    ),
+                }
+            )
 
-        with st.chat_message("assistant"):
+        # --------------------------------------------------------------------
+        # Full rerun.
+        #
+        # This is critical:
+        #
+        # - answer is now in chat_history
+        # - query_running is False
+        # - chat input becomes enabled
+        # - normal chat rendering displays the answer
+        # --------------------------------------------------------------------
 
-            st.error(error_message)
+        st.rerun()
 
-        st.session_state.chat_history.append(
-            {
-                "role": "assistant",
-                "content": error_message,
-            }
-        )
+    # ------------------------------------------------------------------------
+    # Backend/API error
+    # ------------------------------------------------------------------------
+
+    error_message = result.get(
+        "error",
+        "Unable to process your question.",
+    )
+
+    st.session_state.chat_history.append(
+        {
+            "role": "assistant",
+            "content": error_message,
+        }
+    )
+
+    st.rerun()
+
+
+# ============================================================================
+# Run active query monitoring
+# ============================================================================
+
+active_query_fragment()
+
+
+# ============================================================================
+# User input
+#
+# It is disabled ONLY while an actual query is running.
+#
+# Once the fragment stores the answer and calls st.rerun(),
+# query_running becomes False and this becomes active again.
+# ============================================================================
+
+query = st.chat_input(
+    "Ask your credit card question...",
+    disabled=st.session_state.query_running,
+)
+
+
+# ============================================================================
+# Start new query
+# ============================================================================
+
+if query and not st.session_state.query_running:
+
+    print("========== STREAMLIT QUERY ==========")
+
+    print(f"Query     : {query!r}")
+
+    print(f"Thread ID : " f"{st.session_state.thread_id!r}")
+
+    # ------------------------------------------------------------------------
+    # Persist user message immediately.
+    # ------------------------------------------------------------------------
+
+    st.session_state.chat_history.append(
+        {
+            "role": "user",
+            "content": query,
+        }
+    )
+
+    # ------------------------------------------------------------------------
+    # Initialize query state.
+    # ------------------------------------------------------------------------
+
+    st.session_state.active_query = query
+
+    st.session_state.query_running = True
+
+    st.session_state.query_cancel_requested = False
+
+    st.session_state.query_error = None
+
+    st.session_state.query_progress = "Processing your question..."
+
+    # ------------------------------------------------------------------------
+    # Start background request.
+    # ------------------------------------------------------------------------
+
+    st.session_state.query_progress_queue = queue.Queue()
+
+    st.session_state.query_future = _QUERY_EXECUTOR.submit(
+        _execute_query_request,
+        query,
+        st.session_state.thread_id,
+        st.session_state.query_progress_queue,
+    )
+    # ------------------------------------------------------------------------
+    # Rerun immediately.
+    #
+    # The active-query fragment will now show:
+    #
+    #     Processing your question...
+    #     [ Stop ]
+    #
+    # while the background request continues.
+    # ------------------------------------------------------------------------
+
+    st.rerun()
