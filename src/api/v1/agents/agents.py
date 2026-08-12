@@ -1347,19 +1347,19 @@ async def run_search_agent_stream(
     thread_id: str,
 ):
     """
-    Execute the RAG graph and stream:
+    Execute the RAG graph while exposing:
 
-    1. User-facing progress events
-    2. Answer-generation tokens
-    3. Final structured response
-    4. Cancellation events
-    5. Error events
+    - intermediate progress events from _emit_progress()
+    - final response from the appropriate graph node
+    - cancellation events
+    - errors
+
+    DIRECT queries terminate at the router node.
+    Retrieval queries continue through the normal RAG flow.
     """
 
     print("============ INSIDE run_search_agent_stream ============")
 
-    # A previous query using the same thread ID must not leave
-    # the new query cancelled.
     clear_query_cancellation(thread_id)
 
     initial_state = {
@@ -1389,85 +1389,126 @@ async def run_search_agent_stream(
     }
 
     final_response = None
+    selected_route = None
 
     try:
 
-        async for event in rag_graph.astream_events(
+        async for chunk in rag_graph.astream(
             initial_state,
             config=config,
+            stream_mode=["custom", "updates"],
             version="v2",
         ):
 
-            event_name = event.get("event")
-            event_node = event.get("name")
-            event_data = event.get("data", {})
-
             # ================================================================
-            # 1. USER-FACING PROGRESS EVENTS
+            # CUSTOM EVENTS
+            #
+            # These come directly from _emit_progress()
             # ================================================================
 
-            if event_name == "on_custom_event":
+            if chunk["type"] == "custom":
 
-                data = event_data
+                data = chunk["data"]
 
                 if isinstance(data, dict) and data.get("event") == "progress":
-                    yield {
-                        "event": "progress",
-                        "message": data.get(
-                            "message",
-                            "",
-                        ),
-                    }
+
+                    message = data.get(
+                        "message",
+                        "",
+                    )
+
+                    if message:
+
+                        print("[run_search_agent_stream] " f"Progress: {message}")
+
+                        yield {
+                            "event": "progress",
+                            "message": message,
+                        }
+
+                continue
 
             # ================================================================
-            # 2. LLM TOKEN STREAMING
+            # NODE UPDATES
             # ================================================================
 
-            elif (
-                event_name == "on_chat_model_stream" and event_node == "generate_answer"
-            ):
+            if chunk["type"] != "updates":
+                continue
 
-                chunk = event_data.get("chunk")
+            updates = chunk["data"]
 
-                if chunk is None:
+            if not isinstance(updates, dict):
+                continue
+
+            for node_name, node_update in updates.items():
+
+                if not isinstance(node_update, dict):
                     continue
 
-                content = getattr(
-                    chunk,
-                    "content",
-                    None,
-                )
+                # ============================================================
+                # ROUTER
+                #
+                # DIRECT queries end here.
+                # ============================================================
 
-                if isinstance(content, str) and content:
+                if node_name == "router":
 
-                    yield {
-                        "event": "token",
-                        "content": content,
-                    }
+                    selected_route = node_update.get("route")
 
-            # ================================================================
-            # 3. CAPTURE GENERATED RESPONSE
-            # ================================================================
+                    print("[run_search_agent_stream] " f"Route: {selected_route}")
 
-            elif event_name == "on_chain_end" and event_node == "generate_answer":
+                    if selected_route == "DIRECT":
 
-                output = event_data.get("output")
+                        response = node_update.get("response")
 
-                if isinstance(output, dict):
+                        if response:
 
-                    response = output.get("response")
+                            final_response = response
+
+                            print(
+                                "[run_search_agent_stream] " "DIRECT response captured."
+                            )
+
+                # ============================================================
+                # GENERATE ANSWER
+                #
+                # RDBMS / VECTOR / HYBRID queries eventually
+                # produce their response here.
+                # ============================================================
+
+                elif node_name == "generate_answer":
+
+                    response = node_update.get("response")
 
                     if response:
+
+                        final_response = response
+
+                        print("[run_search_agent_stream] " "Answer generated.")
+
+                # ============================================================
+                # OTHER NODE RESPONSES
+                #
+                # If a future node directly produces the final response,
+                # this allows us to capture it without changing the design.
+                # ============================================================
+
+                elif "response" in node_update:
+
+                    response = node_update.get("response")
+
+                    if response:
+
                         final_response = response
 
             # ================================================================
-            # 4. CANCELLATION CHECK
+            # CANCELLATION
             # ================================================================
 
             raise_if_query_cancelled(thread_id)
 
         # ====================================================================
-        # 5. FINAL RESPONSE
+        # FINAL RESPONSE
         # ====================================================================
 
         if final_response is None:
@@ -1475,6 +1516,8 @@ async def run_search_agent_stream(
             raise RuntimeError(
                 "The RAG pipeline completed " "without producing a response."
             )
+
+        print("[run_search_agent_stream] " f"Final route: {selected_route}")
 
         yield {
             "event": "final",
