@@ -14,7 +14,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import HumanMessage, AIMessage
 
 from src.api.v1.states.rag_state import RAGState
-from src.api.v1.tools.vector_search_tool import vector_search_node
+from src.api.v1.tools.tools import (
+    vector_search_node,
+    fts_search_node,
+    vector_fts_search_node,
+)
 from src.api.v1.schemas.query_schema import AIResponse
 from src.core.db import get_sql_database
 from src.core.db import get_cached_schema
@@ -112,6 +116,28 @@ class RouteDecision(BaseModel):
     ]
     reason: str
     direct_response: str
+
+
+class KnowledgeStrategyDecision(BaseModel):
+
+    knowledge_strategy: Literal[
+        "VECTOR",
+        "FTS",
+        "VECTOR_FTS",
+    ]
+
+    reason: str
+
+    retrieval_query: str
+
+    fts_query: str
+
+
+class RetrievalQueryDecision(BaseModel):
+
+    retrieval_query: str
+
+    fts_query: str
 
 
 class EvaluationDecision(BaseModel):
@@ -301,6 +327,234 @@ Current User Question:
     }
 
 
+def knowledge_strategy_router_node(state: RAGState) -> RAGState:
+
+    print("====== INSIDE KNOWLEDGE STRATEGY ROUTER ======")
+
+    _check_cancelled(state)
+
+    _emit_progress("Understanding the question...")
+
+    llm = _get_router_llm()
+    structured_llm = llm.with_structured_output(KnowledgeStrategyDecision)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+You are a retrieval strategy classifier for a banking knowledge base.
+
+Your task is to decide the best document retrieval strategy.
+
+Available strategies:
+
+1. VECTOR
+
+Use VECTOR when:
+- The user is asking for explanation, reasoning, summary, or conceptual understanding.
+- The answer requires semantic understanding.
+- The wording may not exactly match the document.
+
+Examples:
+"What are the benefits of this credit card?"
+"Explain reward redemption rules"
+"How does billing work?"
+
+
+2. FTS
+
+Use FTS when:
+- Exact words, phrases, identifiers, names, codes, or specific terms matter.
+- The user is looking for an exact mention in documents.
+
+Examples:
+"Find the section mentioning NEFT"
+"Where is Statement Credit mentioned?"
+"Find Platinum card"
+
+
+3. VECTOR_FTS
+
+Use VECTOR_FTS when:
+- The query needs both semantic understanding and exact terminology matching.
+- The question is complex or policy/rule based.
+- Missing either semantic or keyword retrieval may reduce recall.
+
+Examples:
+"What are the eligibility rules for accelerated dining rewards?"
+"Explain reward points conversion and redemption options"
+"What is MCC category and how does NorthStar classify transactions?"
+"Explain the dining reward eligibility rules for accelerated points"
+"What are the redemption options and their point conversion values?"
+"Tell me about Platinum card lounge benefits"
+
+After selecting the retrieval strategy, create the appropriate search queries.
+
+The queries serve different purposes.
+
+================================================
+
+retrieval_query:
+
+Used for vector similarity search.
+
+Rules:
+
+- Write a standalone semantic search query.
+- Preserve the user's intent.
+- Add useful banking or credit-card terminology.
+- Expand concepts where helpful.
+- Do not answer the question.
+
+Example:
+
+User:
+"What are reward redemption options?"
+
+retrieval_query:
+"NorthStar credit card reward points redemption options,
+conversion values, and redemption methods"
+
+
+================================================
+
+fts_query:
+
+Used for PostgreSQL full-text search.
+
+Rules:
+
+- Extract important lexical terms.
+- Preserve exact phrases, acronyms, product names,
+  codes, and identifiers.
+- Remove conversational words.
+- Do not create explanations.
+- Do not answer the question.
+
+Example:
+
+User:
+"What is MCC?"
+
+fts_query:
+"MCC Merchant Category Code"
+
+
+================================================
+
+For VECTOR strategy:
+
+Generate:
+- retrieval_query
+
+Set:
+- fts_query as empty string
+
+
+For FTS strategy:
+
+Generate:
+- fts_query
+
+Set:
+- retrieval_query as empty string
+
+
+For VECTOR_FTS strategy:
+
+Generate BOTH.
+
+Example:
+
+User:
+"Explain reward points conversion and redemption options"
+
+knowledge_strategy:
+VECTOR_FTS
+
+retrieval_query:
+"NorthStar credit card reward points conversion,
+redemption options, redemption values and methods"
+
+fts_query:
+"reward points conversion redemption options
+Statement Credit Partner Vouchers Airline Miles"
+
+Important:
+FTS performs lexical matching.
+Use FTS when the user likely expects exact terminology,
+names, phrases, identifiers, or direct references.
+
+Do not choose FTS only because the question contains
+common words like "credit", "card", "reward", or "payment".
+
+Rules:
+- Return ONLY JSON.
+- Do not add explanations.
+
+Output format:
+
+Return ONLY JSON.
+
+Output format:
+
+{{
+"knowledge_strategy": "VECTOR | FTS | VECTOR_FTS",
+"reason": "short explanation",
+"retrieval_query": "semantic search query for vector retrieval",
+"fts_query": "lexical search query for full text search"
+}}
+""",
+            ),
+            (
+                "human",
+                """
+Conversation History:
+
+{history}
+
+Current User Question:
+
+{query}
+""",
+            ),
+        ]
+    )
+
+    chain = prompt | structured_llm
+
+    decision = chain.invoke(
+        {
+            "query": state["query"],
+            "history": state.get("messages", []),
+        }
+    )
+
+    _check_cancelled(state)
+
+    strategy = decision.knowledge_strategy
+
+    if strategy not in (
+        "VECTOR",
+        "FTS",
+        "VECTOR_FTS",
+    ):
+        strategy = "VECTOR_FTS"
+
+    print(f"[knowledge_strategy_router_node] Route : {strategy}")
+
+    print(f"Retrieval Query : {decision.retrieval_query}")
+
+    print(f"FTS Query       : {decision.fts_query}")
+
+    return {
+        "knowledge_strategy": strategy,
+        "retrieval_query": decision.retrieval_query,
+        "fts_query": decision.fts_query,
+    }
+
+
 def hybrid_start_node(state: RAGState) -> RAGState:
 
     print("========= INSIDE HYBRID START NODE =========")
@@ -315,40 +569,116 @@ def hybrid_join_node(state: RAGState) -> RAGState:
     return {}
 
 
-def query_reformulation_node(state: RAGState) -> RAGState:
+def query_optimization_node(state: RAGState) -> RAGState:
 
     _check_cancelled(state)
 
     print("========= INSIDE QUERY REFORMULATION NODE =========")
 
     llm = _get_router_llm()
+    structured_llm = llm.with_structured_output(RetrievalQueryDecision)
 
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 """
-You rewrite user questions into effective search queries for the
-NorthStar Credit Card knowledge base.
+You rewrite user questions into effective retrieval queries
+for the NorthStar Credit Card knowledge base.
 
-Create ONE standalone retrieval query.
+The retrieval strategy is:
 
-Use conversation history to resolve references such as:
-he, she, this, that, previous, same, what about, how about.
+{knowledge_strategy}
 
-Also expand important domain terms with closely related terms when useful
-for document retrieval.
+Generate search queries according to the strategy.
 
 Rules:
 
-- Preserve the user's intent.
-- Resolve conversational references using history.
-- Add useful credit-card terminology or synonyms when they improve retrieval.
 - Do not answer the question.
+- Preserve the user's intent.
 - Do not invent facts, policies, names, amounts, dates, or rules.
-- Do not introduce information that is not present in the question or history.
-- If the question is already clear, make only useful retrieval improvements.
-- Return only the search query.
+- Only improve retrieval effectiveness.
+
+================================================
+
+VECTOR strategy:
+
+Create only a semantic retrieval query.
+
+The query should:
+- capture the meaning of the question
+- add useful banking or credit-card terminology
+- expand concepts when helpful
+
+Example:
+
+Question:
+"What are reward redemption options?"
+
+retrieval_query:
+"NorthStar credit card reward points redemption options,
+conversion values, and redemption methods"
+
+================================================
+
+FTS strategy:
+
+Create only a lexical search query.
+
+The query should:
+- preserve exact terms
+- preserve acronyms
+- preserve product names
+- remove conversational words
+
+Remove words like:
+what, why, how, explain, find, section, mentioned
+
+Example:
+
+Question:
+"What is MCC?"
+
+fts_query:
+"MCC Merchant Category Code"
+
+
+Question:
+"Where is Statement Credit mentioned?"
+
+fts_query:
+"Statement Credit"
+
+================================================
+
+VECTOR_FTS strategy:
+
+Create BOTH queries.
+
+retrieval_query:
+- semantic query for vector similarity search
+- include context and meaning
+
+fts_query:
+- keyword-focused query for PostgreSQL FTS
+- preserve exact document terminology
+
+Example:
+
+Question:
+"Explain reward points conversion and redemption options"
+
+retrieval_query:
+"NorthStar credit card reward points conversion,
+redemption options, redemption values and methods"
+
+fts_query:
+"reward points conversion redemption options
+Statement Credit Partner Vouchers Airline Miles"
+
+================================================
+
+Return only the structured output.
 """,
             ),
             (
@@ -361,30 +691,41 @@ Conversation History:
 Current Question:
 
 {query}
+
+Retrieval Strategy:
+
+{knowledge_strategy}
 """,
             ),
         ]
     )
 
-    chain = prompt | llm
+    chain = prompt | structured_llm
 
     result = chain.invoke(
         {
             "history": state.get("messages", []),
             "query": state["query"],
+            "knowledge_strategy": state.get(
+                "knowledge_strategy",
+                "VECTOR",
+            ),
         }
     )
 
     _check_cancelled(state)
 
-    retrieval_query = result.content.strip()
-
     print("========= QUERY REFORMULATION =========")
-    print(f"Original Query  : {state['query']}")
-    print(f"Retrieval Query : {retrieval_query}")
+
+    print(f"Original Query       : {state['query']}")
+
+    print(f"Retrieval Query      : {result.retrieval_query}")
+
+    print(f"FTS Query            : {result.fts_query}")
 
     return {
-        "retrieval_query": retrieval_query,
+        "retrieval_query": result.retrieval_query,
+        "fts_query": result.fts_query,
     }
 
 
@@ -1074,36 +1415,92 @@ def should_reformulate_after_search(
         0,
     )
 
-    # Never reformulate more than once.
+    strategy = state.get(
+        "knowledge_strategy",
+        "VECTOR",
+    )
+
+    # ------------------------------------------------------------------
+    # Never reformulate more than once
+    # ------------------------------------------------------------------
+
     if attempt >= 2:
         return False
 
-    # No results.
+    # ------------------------------------------------------------------
+    # No results
+    # ------------------------------------------------------------------
+
     if not docs:
 
-        print("[retrieval_quality] " "No documents found. Reformulating query.")
+        print(
+            "[retrieval_quality] "
+            f"No documents found for strategy {strategy}. "
+            "Reformulating query."
+        )
 
         return True
 
-    similarity_threshold = 0.50
+    # ------------------------------------------------------------------
+    # Strategy-specific scoring
+    # ------------------------------------------------------------------
+
+    if strategy == "VECTOR":
+
+        score_key = "similarity"
+        threshold = 0.50
+
+    elif strategy == "FTS":
+
+        score_key = "fts_rank"
+
+        # FTS scores are much smaller than vector similarity scores.
+        # Tune this based on your observed PostgreSQL ts_rank values.
+        threshold = 0.05
+
+    elif strategy == "VECTOR_FTS":
+
+        # RRF scores are lower magnitude than vector similarity.
+        # Tune threshold based on observed reciprocal rank values.
+        threshold = 0.01
+
+    else:
+
+        print(
+            "[retrieval_quality] "
+            f"Unknown strategy {strategy}. "
+            "Defaulting to VECTOR scoring."
+        )
+
+        score_key = "similarity"
+        threshold = 0.50
+
+    # ------------------------------------------------------------------
+    # Calculate relevant documents
+    # ------------------------------------------------------------------
 
     relevant_docs = [
         doc
         for doc in docs
         if (
-            doc.metadata.get("similarity") is not None
-            and doc.metadata.get("similarity") >= similarity_threshold
+            doc.metadata.get(score_key) is not None
+            and doc.metadata.get(score_key) >= threshold
         )
     ]
 
-    top_similarity = docs[0].metadata.get("similarity")
+    top_score = docs[0].metadata.get(score_key)
 
     print(
         "[retrieval_quality] "
-        f"Top similarity: {top_similarity} | "
+        f"Strategy: {strategy} | "
+        f"Top {score_key}: {top_score} | "
         f"Relevant docs: {len(relevant_docs)} | "
         f"Attempt: {attempt}"
     )
+
+    # ------------------------------------------------------------------
+    # Quality decision
+    # ------------------------------------------------------------------
 
     if len(relevant_docs) < 3:
 
@@ -1122,12 +1519,12 @@ def should_reformulate_after_search(
     return False
 
 
-def route_after_vector_search(
+def route_after_retrieval(
     state: RAGState,
 ) -> str:
 
     if should_reformulate_after_search(state):
-        return "REFORMULATE"
+        return "OPTIMIZE"
 
     return "CONTINUE"
 
@@ -1143,6 +1540,50 @@ def route_after_evaluation(
         return "REGENERATE"
 
     return "END"
+
+
+def route_knowledge_strategy(state: RAGState):
+
+    strategy = state.get("knowledge_strategy")
+
+    if strategy == "VECTOR":
+        return "VECTOR"
+
+    if strategy == "FTS":
+        return "FTS"
+
+    if strategy == "VECTOR_FTS":
+        return "VECTOR_FTS"
+
+    return "VECTOR"
+
+
+def route_after_reformulation(
+    state: RAGState,
+):
+
+    strategy = state.get("knowledge_strategy")
+
+    print(f"[route_after_reformulation] Strategy: {strategy}")
+
+    if strategy == "FTS":
+
+        return "fts_search"
+
+    if strategy == "VECTOR_FTS":
+
+        return "vector_fts_search"
+
+    return "vector_search"
+
+
+def increment_retrieval_attempt_node(state: RAGState) -> RAGState:
+
+    attempt = state.get("retrieval_attempt", 0) + 1
+
+    print(f"====== RETRIEVAL ATTEMPT {attempt} ======")
+
+    return {"retrieval_attempt": attempt}
 
 
 def hybrid_vector_done_node(state: RAGState) -> RAGState:
@@ -1168,34 +1609,173 @@ def build_rag_graph():
     # Nodes
     # ------------------------------------------------------------------------
 
-    workflow.add_node("router", router_node)
-    workflow.add_node("hybrid_start", hybrid_start_node)
-    workflow.add_node("hybrid_join", hybrid_join_node)
-    workflow.add_node("hybrid_vector_done", hybrid_vector_done_node)
-    workflow.add_node("hybrid_sql_done", hybrid_sql_done_node)
-    workflow.add_node("nl2sql", nl2sql_node)
-    workflow.add_node("vector_search", vector_search_node)
-    workflow.add_node("query_reformulation", query_reformulation_node)
-    workflow.add_node("rerank", rerank_node)
-    workflow.add_node("merge_context", merge_context_node)
-    workflow.add_node("generate_answer", generate_answer_node)
-    workflow.add_node("evaluate_answer", evaluate_answer_node)
+    # Primary routing
+    workflow.add_node(
+        "router",
+        router_node,
+    )
+
+    # ------------------------------------------------------------------------
+    # Existing Hybrid (Vector + RDBMS)
+    # ------------------------------------------------------------------------
+
+    workflow.add_node(
+        "hybrid_start",
+        hybrid_start_node,
+    )
+
+    workflow.add_node(
+        "hybrid_join",
+        hybrid_join_node,
+    )
+
+    workflow.add_node(
+        "hybrid_vector_done",
+        hybrid_vector_done_node,
+    )
+
+    workflow.add_node(
+        "hybrid_sql_done",
+        hybrid_sql_done_node,
+    )
+
+    # ------------------------------------------------------------------------
+    # RDBMS
+    # ------------------------------------------------------------------------
+
+    workflow.add_node(
+        "nl2sql",
+        nl2sql_node,
+    )
+
+    # ------------------------------------------------------------------------
+    # Knowledge Retrieval Layer
+    # ------------------------------------------------------------------------
+
+    workflow.add_node(
+        "knowledge_strategy_router",
+        knowledge_strategy_router_node,
+    )
+
+    workflow.add_node(
+        "vector_search",
+        vector_search_node,
+    )
+
+    workflow.add_node(
+        "fts_search",
+        fts_search_node,
+    )
+
+    workflow.add_node(
+        "vector_fts_search",
+        vector_fts_search_node,
+    )
+
+    workflow.add_node(
+        "increment_retrieval_attempt",
+        increment_retrieval_attempt_node,
+    )
+
+    # ------------------------------------------------------------------------
+    # Retrieval Improvement
+    # ------------------------------------------------------------------------
+
+    workflow.add_node(
+        "query_optimization",
+        query_optimization_node,
+    )
+
+    workflow.add_node(
+        "rerank",
+        rerank_node,
+    )
+
+    # ------------------------------------------------------------------------
+    # Answer Generation
+    # ------------------------------------------------------------------------
+
+    workflow.add_node(
+        "merge_context",
+        merge_context_node,
+    )
+
+    workflow.add_node(
+        "generate_answer",
+        generate_answer_node,
+    )
+
+    workflow.add_node(
+        "evaluate_answer",
+        evaluate_answer_node,
+    )
+
+    # ------------------------------------------------------------------------
+    # Entry Point
+    # ------------------------------------------------------------------------
 
     workflow.set_entry_point("router")
+
+    # ------------------------------------------------------------------------
+    # PRIMARY ROUTER
+    #
+    # Decides:
+    # VECTOR_DB
+    # RDBMS
+    # HYBRID
+    # DIRECT
+    # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
         "router",
         lambda state: state["route"],
         {
-            "VECTOR_DB": "vector_search",
+            "VECTOR_DB": "knowledge_strategy_router",
             "RDBMS": "nl2sql",
             "HYBRID": "hybrid_start",
             "DIRECT": END,
         },
     )
 
-    workflow.add_edge("hybrid_start", "vector_search")
-    workflow.add_edge("hybrid_start", "nl2sql")
+    # ------------------------------------------------------------------------
+    # KNOWLEDGE RETRIEVAL STRATEGY ROUTER
+    #
+    # Decides:
+    # VECTOR
+    # FTS
+    # VECTOR_FTS
+    #
+    # VECTOR_FTS temporarily points to vector_search
+    # until RRF hybrid is implemented
+    # ------------------------------------------------------------------------
+
+    workflow.add_conditional_edges(
+        "knowledge_strategy_router",
+        route_knowledge_strategy,
+        {
+            "VECTOR": "vector_search",
+            "FTS": "fts_search",
+            "VECTOR_FTS": "vector_fts_search",
+        },
+    )
+
+    # ------------------------------------------------------------------------
+    # EXISTING VECTOR + RDBMS HYBRID FLOW
+    # ------------------------------------------------------------------------
+
+    workflow.add_edge(
+        "hybrid_start",
+        "knowledge_strategy_router",
+    )
+
+    workflow.add_edge(
+        "hybrid_start",
+        "nl2sql",
+    )
+
+    # ------------------------------------------------------------------------
+    # NL2SQL ROUTING
+    # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
         "nl2sql",
@@ -1206,14 +1786,67 @@ def build_rag_graph():
         },
     )
 
-    workflow.add_conditional_edges(
+    # ------------------------------------------------------------------------
+    # RETRIEVAL FLOW
+    #
+    # Search
+    #    |
+    # Increment attempt
+    #    |
+    # Decide:
+    #       Reformulate
+    #       Continue
+    #
+    # ------------------------------------------------------------------------
+
+    workflow.add_edge(
         "vector_search",
-        route_after_vector_search,
+        "increment_retrieval_attempt",
+    )
+
+    workflow.add_edge(
+        "fts_search",
+        "increment_retrieval_attempt",
+    )
+
+    workflow.add_edge(
+        "vector_fts_search",
+        "increment_retrieval_attempt",
+    )
+
+    workflow.add_conditional_edges(
+        "increment_retrieval_attempt",
+        route_after_retrieval,
         {
-            "REFORMULATE": "query_reformulation",
+            "OPTIMIZE": "query_optimization",
             "CONTINUE": "rerank",
         },
     )
+
+    # ------------------------------------------------------------------------
+    # QUERY REFORMULATION RETRY
+    #
+    # Important:
+    # Retry the SAME retrieval strategy
+    #
+    # VECTOR  -> vector_search
+    # FTS     -> fts_search
+    #
+    # ------------------------------------------------------------------------
+
+    workflow.add_conditional_edges(
+        "query_optimization",
+        route_after_reformulation,
+        {
+            "vector_search": "vector_search",
+            "fts_search": "fts_search",
+            "vector_fts_search": "vector_fts_search",
+        },
+    )
+
+    # ------------------------------------------------------------------------
+    # RERANKING
+    # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
         "rerank",
@@ -1224,11 +1857,36 @@ def build_rag_graph():
         },
     )
 
-    workflow.add_edge("query_reformulation", "vector_search")
-    workflow.add_edge(["hybrid_vector_done", "hybrid_sql_done"], "hybrid_join")
-    workflow.add_edge("hybrid_join", "merge_context")
-    workflow.add_edge("merge_context", "generate_answer")
-    workflow.add_edge("generate_answer", "evaluate_answer")
+    # ------------------------------------------------------------------------
+    # EXISTING HYBRID JOIN
+    # ------------------------------------------------------------------------
+
+    workflow.add_edge(
+        [
+            "hybrid_vector_done",
+            "hybrid_sql_done",
+        ],
+        "hybrid_join",
+    )
+
+    workflow.add_edge(
+        "hybrid_join",
+        "merge_context",
+    )
+
+    # ------------------------------------------------------------------------
+    # RESPONSE GENERATION
+    # ------------------------------------------------------------------------
+
+    workflow.add_edge(
+        "merge_context",
+        "generate_answer",
+    )
+
+    workflow.add_edge(
+        "generate_answer",
+        "evaluate_answer",
+    )
 
     # ------------------------------------------------------------------------
     # EVALUATION
@@ -1243,7 +1901,6 @@ def build_rag_graph():
             "END": END,
         },
     )
-
     # ------------------------------------------------------------------------
     # CHECKPOINT
     # ------------------------------------------------------------------------

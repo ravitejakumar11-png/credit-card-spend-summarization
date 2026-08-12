@@ -7,9 +7,14 @@ from langgraph.graph.message import add_messages
 class RAGState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     thread_id: str
+    knowledge_strategy: str
     query: str
     route: str
     retrieval_query: str
+    fts_query: str
+    vector_docs: list
+    fts_docs: list
+    rrf_docs: list
     retrieval_attempt: int
     retrieved_docs: list
     reranked_docs: list
