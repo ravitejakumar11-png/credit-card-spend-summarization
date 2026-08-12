@@ -1,3 +1,4 @@
+import json
 import os
 
 import cohere
@@ -1325,7 +1326,6 @@ def run_search_agent(
     }
 
     try:
-
         final_state = rag_graph.invoke(
             initial_state,
             config=config,
@@ -1334,24 +1334,32 @@ def run_search_agent(
         return final_state["response"]
 
     finally:
-
         clear_query_cancellation(thread_id)
 
 
-def run_search_agent_stream(
+# ============================================================================
+# STREAMING ENTRY POINT
+# ============================================================================
+
+
+async def run_search_agent_stream(
     query: str,
     thread_id: str,
 ):
     """
-    Execute the RAG graph and expose only user-facing
-    progress/final/cancellation/error events.
+    Execute the RAG graph and stream:
+
+    1. User-facing progress events
+    2. Answer-generation tokens
+    3. Final structured response
+    4. Cancellation events
+    5. Error events
     """
 
     print("============ INSIDE run_search_agent_stream ============")
 
-    # Important:
-    # A previous query using the same Streamlit thread ID
-    # must not leave the new query cancelled.
+    # A previous query using the same thread ID must not leave
+    # the new query cancelled.
     clear_query_cancellation(thread_id)
 
     initial_state = {
@@ -1384,26 +1392,25 @@ def run_search_agent_stream(
 
     try:
 
-        for chunk in rag_graph.stream(
+        async for event in rag_graph.astream_events(
             initial_state,
             config=config,
-            stream_mode=[
-                "custom",
-                "updates",
-            ],
             version="v2",
         ):
 
-            # --------------------------------------------------------------
-            # USER-FACING PROGRESS
-            # --------------------------------------------------------------
+            event_name = event.get("event")
+            event_node = event.get("name")
+            event_data = event.get("data", {})
 
-            if chunk["type"] == "custom":
+            # ================================================================
+            # 1. USER-FACING PROGRESS EVENTS
+            # ================================================================
 
-                data = chunk["data"]
+            if event_name == "on_custom_event":
+
+                data = event_data
 
                 if isinstance(data, dict) and data.get("event") == "progress":
-
                     yield {
                         "event": "progress",
                         "message": data.get(
@@ -1412,29 +1419,56 @@ def run_search_agent_stream(
                         ),
                     }
 
-            # --------------------------------------------------------------
-            # INTERNAL STATE UPDATES
-            # --------------------------------------------------------------
+            # ================================================================
+            # 2. LLM TOKEN STREAMING
+            # ================================================================
 
-            elif chunk["type"] == "updates":
+            elif (
+                event_name == "on_chat_model_stream" and event_node == "generate_answer"
+            ):
 
-                updates = chunk["data"]
+                chunk = event_data.get("chunk")
 
-                if not isinstance(updates, dict):
+                if chunk is None:
                     continue
 
-                for _, node_update in updates.items():
+                content = getattr(
+                    chunk,
+                    "content",
+                    None,
+                )
 
-                    if not isinstance(
-                        node_update,
-                        dict,
-                    ):
-                        continue
+                if isinstance(content, str) and content:
 
-                    response = node_update.get("response")
+                    yield {
+                        "event": "token",
+                        "content": content,
+                    }
+
+            # ================================================================
+            # 3. CAPTURE GENERATED RESPONSE
+            # ================================================================
+
+            elif event_name == "on_chain_end" and event_node == "generate_answer":
+
+                output = event_data.get("output")
+
+                if isinstance(output, dict):
+
+                    response = output.get("response")
 
                     if response:
                         final_response = response
+
+            # ================================================================
+            # 4. CANCELLATION CHECK
+            # ================================================================
+
+            raise_if_query_cancelled(thread_id)
+
+        # ====================================================================
+        # 5. FINAL RESPONSE
+        # ====================================================================
 
         if final_response is None:
 

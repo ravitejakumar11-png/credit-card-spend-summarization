@@ -3,20 +3,12 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from src.api.v1.schemas.query_schema import (
-    QueryRequest,
-    QueryResponse,
-)
-
+from src.api.v1.schemas.query_schema import QueryRequest, QueryResponse
+from src.api.v1.services.query_cancellation import cancel_query
 from src.api.v1.services.query_service import (
     query_documents,
     query_documents_stream,
 )
-
-from src.api.v1.services.query_cancellation import (
-    cancel_query,
-)
-
 from src.core.db import EmbeddingServiceError
 
 router = APIRouter(prefix="/api/v1/query")
@@ -31,16 +23,13 @@ router = APIRouter(prefix="/api/v1/query")
 def query_endpoint(
     request: QueryRequest,
 ) -> QueryResponse:
-
     try:
-
         return query_documents(
             query=request.query,
             thread_id=request.thread_id,
         )
 
     except EmbeddingServiceError as exc:
-
         print("[query_route] " f"Embedding service unavailable: {exc}")
 
         raise HTTPException(
@@ -49,7 +38,6 @@ def query_endpoint(
         ) from exc
 
     except Exception as exc:
-
         print("[query_route] " f"Query processing failed: {exc}")
 
         raise HTTPException(
@@ -64,33 +52,29 @@ def query_endpoint(
 
 
 @router.post("/stream")
-def query_stream_endpoint(
+async def stream_query_endpoint(
     request: QueryRequest,
 ):
+    """
+    Stream progress updates and final/token events from the RAG agent
+    using Server-Sent Events (SSE).
+    """
 
-    def event_generator():
+    async def event_generator():
 
         try:
-
-            for event in query_documents_stream(
+            async for event in query_documents_stream(
                 query=request.query,
                 thread_id=request.thread_id,
             ):
-
-                yield (
-                    json.dumps(
-                        event,
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                yield (f"data: " f"{json.dumps(event, ensure_ascii=False)}" "\n\n")
 
         except EmbeddingServiceError as exc:
-
             print("[query_stream_route] " f"Embedding service unavailable: {exc}")
 
             yield (
-                json.dumps(
+                "data: "
+                + json.dumps(
                     {
                         "event": "error",
                         "status_code": 503,
@@ -99,31 +83,33 @@ def query_stream_endpoint(
                             "currently unavailable. "
                             "Please try again later."
                         ),
-                    }
+                    },
+                    ensure_ascii=False,
                 )
-                + "\n"
+                + "\n\n"
             )
 
         except Exception as exc:
-
             print("[query_stream_route] " f"Streaming query failed: {exc}")
 
             yield (
-                json.dumps(
+                "data: "
+                + json.dumps(
                     {
                         "event": "error",
                         "status_code": 500,
                         "message": (
                             "Unable to process your question. " "Please try again."
                         ),
-                    }
+                    },
+                    ensure_ascii=False,
                 )
-                + "\n"
+                + "\n\n"
             )
 
     return StreamingResponse(
         event_generator(),
-        media_type="application/x-ndjson",
+        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
@@ -140,9 +126,7 @@ def query_stream_endpoint(
 def cancel_query_endpoint(
     thread_id: str,
 ):
-
     try:
-
         cancel_query(thread_id)
 
         return {
@@ -152,7 +136,6 @@ def cancel_query_endpoint(
         }
 
     except Exception as exc:
-
         print("[query_route] " f"Failed to cancel query: {exc}")
 
         raise HTTPException(

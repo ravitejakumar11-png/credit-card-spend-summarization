@@ -69,6 +69,9 @@ if "query_progress" not in st.session_state:
 
 if "query_progress_queue" not in st.session_state:
     st.session_state.query_progress_queue = None
+
+if "streaming_answer" not in st.session_state:
+    st.session_state.streaming_answer = ""
 # ============================================================================
 # Delete / Clear / Ingestion state
 # ============================================================================
@@ -110,15 +113,18 @@ def _execute_query_request(
     thread_id: str,
     progress_queue: queue.Queue,
 ) -> dict:
+    """Run the FastAPI streaming request in a background thread.
+
+    The backend sends SSE events for progress, answer tokens, final response,
+    cancellation, and errors. Events are forwarded to the Streamlit fragment
+    through a thread-safe queue.
+    """
 
     print("========== BACKGROUND QUERY WORKER ==========")
-
     print(f"Query     : {query!r}")
-
     print(f"Thread ID : {thread_id!r}")
 
     try:
-
         with requests.post(
             f"{API_BASE_URL}/api/v1/query/stream",
             json={
@@ -130,11 +136,9 @@ def _execute_query_request(
         ) as response:
 
             print("========== STREAMING API RESPONSE ==========")
-
             print(f"Status code : {response.status_code}")
 
             if not response.ok:
-
                 return {
                     "status": "error",
                     "error": (
@@ -144,66 +148,64 @@ def _execute_query_request(
                     ),
                 }
 
-            # IMPORTANT:
-            # chunk_size=1 helps small NDJSON progress events arrive
-            # without unnecessary buffering.
             for line in response.iter_lines(
                 chunk_size=1,
                 decode_unicode=True,
             ):
-
                 if not line:
                     continue
 
+                # FastAPI returns Server-Sent Events in the form:
+                # data: {JSON payload}
+                if not line.startswith("data:"):
+                    continue
+
+                data = line[len("data:") :].strip()
+
+                if data == "[DONE]":
+                    break
+
                 try:
-
-                    event = json.loads(line)
-
+                    event = json.loads(data)
                 except json.JSONDecodeError:
+                    print("[query_worker] Ignoring invalid stream event.")
+                    continue
 
-                    print("[query_worker] " "Ignoring invalid stream event.")
-
+                if not isinstance(event, dict):
                     continue
 
                 event_type = event.get("event")
 
-                # ============================================================
-                # PROGRESS EVENT
-                # ============================================================
-
                 if event_type == "progress":
-
-                    message = event.get(
-                        "message",
-                        "",
-                    )
-
+                    message = event.get("message", "")
                     if message:
-
-                        print("[query_worker] Progress: " f"{message}")
-
-                        # Send progress to the Streamlit fragment.
-                        progress_queue.put(message)
-
+                        print(f"[query_worker] Progress: {message}")
+                        progress_queue.put(
+                            {
+                                "event": "progress",
+                                "message": message,
+                            }
+                        )
                     continue
 
-                # ============================================================
-                # FINAL RESPONSE
-                # ============================================================
+                if event_type == "token":
+                    token = event.get("content", "")
+                    if token:
+                        progress_queue.put(
+                            {
+                                "event": "token",
+                                "content": token,
+                            }
+                        )
+                    continue
 
                 if event_type == "final":
-
                     return {
                         "status": "success",
                         "response": event.get("data"),
                     }
 
-                # ============================================================
-                # CANCELLATION
-                # ============================================================
-
                 if event_type == "cancelled":
-
                     return {
                         "status": "cancelled",
                         "message": event.get(
@@ -212,12 +214,7 @@ def _execute_query_request(
                         ),
                     }
 
-                # ============================================================
-                # BACKEND ERROR
-                # ============================================================
-
                 if event_type == "error":
-
                     return {
                         "status": "error",
                         "error": event.get(
@@ -235,18 +232,14 @@ def _execute_query_request(
             }
 
     except requests.RequestException as exc:
-
-        print("[query_worker] Request failed: " f"{exc}")
-
+        print(f"[query_worker] Request failed: {exc}")
         return {
             "status": "error",
             "error": ("Could not connect to the FastAPI server. " "Please try again."),
         }
 
     except Exception as exc:
-
-        print("[query_worker] Unexpected error: " f"{exc}")
-
+        print(f"[query_worker] Unexpected error: {exc}")
         return {
             "status": "error",
             "error": (
@@ -268,6 +261,20 @@ with st.sidebar:
         "Enable Developer Mode",
         value=False,
     )
+
+    # -----------------------------------------------------------------------
+    # Clear Chat
+    # -----------------------------------------------------------------------
+
+    st.divider()
+
+    if st.button(
+        "Clear Chat",
+        use_container_width=True,
+    ):
+        st.session_state.chat_history = []
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.rerun()
 
     if developer_mode:
 
@@ -614,7 +621,7 @@ for message in st.session_state.chat_history:
 
     with st.chat_message(message["role"]):
 
-        st.write(message["content"])
+        st.markdown(message["content"])
 
 
 # ============================================================================
@@ -639,73 +646,80 @@ for message in st.session_state.chat_history:
 def active_query_fragment():
 
     if not st.session_state.query_running:
-
         return
 
     # ------------------------------------------------------------------------
-    # Read progress events produced by the background query worker.
+    # Read progress/token events from the background query worker.
     # ------------------------------------------------------------------------
 
     progress_queue = st.session_state.query_progress_queue
 
     if progress_queue is not None:
-
         latest_progress = None
 
         while True:
-
             try:
-
-                latest_progress = progress_queue.get_nowait()
-
+                event = progress_queue.get_nowait()
             except queue.Empty:
-
                 break
 
-        if latest_progress:
+            if not isinstance(event, dict):
+                continue
 
+            event_type = event.get("event")
+
+            if event_type == "progress":
+                message = event.get("message", "")
+                if message:
+                    latest_progress = message
+
+            elif event_type == "token":
+                token = event.get("content", "")
+                if token:
+                    st.session_state.streaming_answer += token
+
+        if latest_progress:
             st.session_state.query_progress = latest_progress
+
     # ------------------------------------------------------------------------
     # Processing indicator
     # ------------------------------------------------------------------------
 
     if st.session_state.query_cancel_requested:
-
         st.info("Stopping your request...")
-
     else:
-
         progress_message = (
             st.session_state.query_progress or "Processing your question..."
         )
-
         st.info(progress_message)
+
+    # ------------------------------------------------------------------------
+    # Live streamed answer
+    # ------------------------------------------------------------------------
+
+    if st.session_state.streaming_answer:
+        with st.chat_message("assistant"):
+            st.markdown(st.session_state.streaming_answer)
 
     # ------------------------------------------------------------------------
     # Stop button
     # ------------------------------------------------------------------------
 
     if st.session_state.query_cancel_requested:
-
         st.button(
             "⏹ Stopping...",
             disabled=True,
             use_container_width=True,
         )
-
     else:
-
         if st.button(
             "⏹ Stop",
             use_container_width=True,
         ):
-
             print("========== QUERY CANCELLATION REQUEST ==========")
-
-            print(f"Thread ID : " f"{st.session_state.thread_id!r}")
+            print(f"Thread ID : {st.session_state.thread_id!r}")
 
             try:
-
                 response = requests.post(
                     f"{API_BASE_URL}/api/v1/query/cancel/"
                     f"{st.session_state.thread_id}",
@@ -713,15 +727,10 @@ def active_query_fragment():
                 )
 
                 if response.ok:
-
                     print("[ui] Cancellation requested.")
-
                     st.session_state.query_cancel_requested = True
-
                     st.rerun()
-
                 else:
-
                     st.error(
                         "Unable to stop the query: "
                         f"{response.status_code} - "
@@ -729,7 +738,6 @@ def active_query_fragment():
                     )
 
             except requests.RequestException as exc:
-
                 st.error("Could not connect to the " f"{API_BASE_URL} server: {exc}")
 
     # ------------------------------------------------------------------------
@@ -739,11 +747,8 @@ def active_query_fragment():
     future = st.session_state.query_future
 
     if future is None:
-
         st.session_state.query_running = False
-
         st.session_state.query_error = "The query could not be started."
-
         st.rerun()
 
     # ------------------------------------------------------------------------
@@ -751,7 +756,6 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
 
     if not future.done():
-
         return
 
     # ------------------------------------------------------------------------
@@ -759,13 +763,9 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
 
     try:
-
         result = future.result()
-
     except Exception as exc:
-
-        print("[ui] Background query failed: " f"{exc}")
-
+        print(f"[ui] Background query failed: {exc}")
         result = {
             "status": "error",
             "error": (
@@ -785,37 +785,28 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
 
     st.session_state.query_running = False
-
     st.session_state.query_future = None
-
     st.session_state.active_query = None
-
     st.session_state.query_cancel_requested = False
-
     st.session_state.query_progress = None
-
     st.session_state.query_progress_queue = None
 
     # ------------------------------------------------------------------------
     # If user pressed Stop, do not display the eventual answer.
     # ------------------------------------------------------------------------
 
-    if was_cancel_requested:
-
-        stop_message = "The query was stopped."
+    if was_cancel_requested or result.get("status") == "cancelled":
+        st.session_state.streaming_answer = ""
 
         st.session_state.chat_history.append(
             {
                 "role": "assistant",
-                "content": stop_message,
+                "content": result.get(
+                    "message",
+                    "The query was stopped.",
+                ),
             }
         )
-
-        # Full rerun:
-        #
-        # - active fragment disappears
-        # - chat input becomes enabled
-        # - stop message appears in chat history
 
         st.rerun()
 
@@ -824,45 +815,31 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
 
     if result.get("status") == "success":
-
         final_response = result.get("response")
 
         if final_response:
-
-            answer = final_response.get(
-                "answer",
-                "",
-            )
+            answer = final_response.get("answer", "")
 
             if answer:
-
-                # ------------------------------------------------------------
-                # IMPORTANT:
-                #
-                # Persist the answer BEFORE rerunning.
-                # ------------------------------------------------------------
-
+                # The final structured response is authoritative.
+                # Persist it before rerunning so it appears in chat history.
                 st.session_state.chat_history.append(
                     {
                         "role": "assistant",
                         "content": answer,
                     }
                 )
-
             else:
-
                 st.session_state.chat_history.append(
                     {
                         "role": "assistant",
                         "content": (
-                            "The assistant could not produce "
-                            "a response. Please try again."
+                            "The assistant did not return a response. "
+                            "Please try again."
                         ),
                     }
                 )
-
         else:
-
             st.session_state.chat_history.append(
                 {
                     "role": "assistant",
@@ -872,17 +849,7 @@ def active_query_fragment():
                 }
             )
 
-        # --------------------------------------------------------------------
-        # Full rerun.
-        #
-        # This is critical:
-        #
-        # - answer is now in chat_history
-        # - query_running is False
-        # - chat input becomes enabled
-        # - normal chat rendering displays the answer
-        # --------------------------------------------------------------------
-
+        st.session_state.streaming_answer = ""
         st.rerun()
 
     # ------------------------------------------------------------------------
@@ -893,6 +860,8 @@ def active_query_fragment():
         "error",
         "Unable to process your question.",
     )
+
+    st.session_state.streaming_answer = ""
 
     st.session_state.chat_history.append(
         {
@@ -962,6 +931,8 @@ if query and not st.session_state.query_running:
     st.session_state.query_error = None
 
     st.session_state.query_progress = "Processing your question..."
+
+    st.session_state.streaming_answer = ""
 
     # ------------------------------------------------------------------------
     # Start background request.
