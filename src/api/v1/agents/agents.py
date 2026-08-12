@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
+from langgraph.config import get_stream_writer
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 from typing import Literal
@@ -17,8 +18,65 @@ from src.api.v1.tools.vector_search_tool import vector_search_node
 from src.api.v1.schemas.query_schema import AIResponse
 from src.core.db import get_sql_database
 from src.core.db import get_cached_schema
+from src.api.v1.services.query_cancellation import (
+    raise_if_query_cancelled,
+    clear_query_cancellation,
+    QueryCancelled,
+)
 
 load_dotenv()
+
+
+def _check_cancelled(state: RAGState) -> None:
+
+    thread_id = state.get("thread_id")
+
+    raise_if_query_cancelled(thread_id)
+
+
+# ============================================================================
+# USER-FACING STREAMING
+# ============================================================================
+
+
+def _emit_progress(message: str) -> None:
+    """
+    Emit a small, user-facing progress update.
+
+    IMPORTANT:
+        This intentionally exposes only high-level progress.
+
+    It does NOT expose:
+        - routing decisions
+        - retrieval queries
+        - similarity scores
+        - retrieval attempts
+        - reranking
+        - query reformulation
+        - SQL
+        - evaluation
+        - regeneration
+        - internal node names
+    """
+
+    try:
+
+        writer = get_stream_writer()
+
+        writer(
+            {
+                "event": "progress",
+                "message": message,
+            }
+        )
+
+    except Exception:
+        # Streaming is an optional UI feature.
+        #
+        # If the graph is being executed using normal invoke()
+        # rather than stream(), progress events should never break
+        # the actual RAG pipeline.
+        pass
 
 
 def _get_router_llm():
@@ -63,7 +121,11 @@ class EvaluationDecision(BaseModel):
 
 def router_node(state: RAGState) -> RAGState:
 
+    _check_cancelled(state)
+
     print("========= INSIDE ROUTER NODE =========")
+
+    _emit_progress("Understanding your question...")
 
     llm = _get_router_llm()
     structured_llm = llm.with_structured_output(RouteDecision)
@@ -207,6 +269,22 @@ Current User Question:
         }
     )
 
+    _check_cancelled(state)
+
+    if decision.route == "RDBMS":
+
+        _emit_progress("Checking your account information...")
+
+    elif decision.route == "VECTOR_DB":
+
+        _emit_progress("Checking the relevant card information...")
+
+    elif decision.route == "HYBRID":
+
+        _emit_progress("Checking your account information...")
+
+        _emit_progress("Checking the relevant card information...")
+
     print(f"[router_node] Route : {decision.route}")
     print(f"[router_node] Reason: {decision.reason}")
 
@@ -238,6 +316,8 @@ def hybrid_join_node(state: RAGState) -> RAGState:
 
 
 def query_reformulation_node(state: RAGState) -> RAGState:
+
+    _check_cancelled(state)
 
     print("========= INSIDE QUERY REFORMULATION NODE =========")
 
@@ -295,6 +375,8 @@ Current Question:
         }
     )
 
+    _check_cancelled(state)
+
     retrieval_query = result.content.strip()
 
     print("========= QUERY REFORMULATION =========")
@@ -307,6 +389,8 @@ Current Question:
 
 
 def nl2sql_node(state: RAGState) -> RAGState:
+
+    _check_cancelled(state)
 
     print("========= INSIDE NL2SQL NODE =========")
 
@@ -413,6 +497,8 @@ Current User Question:
         }
     )
 
+    _check_cancelled(state)
+
     generated_sql = raw_sql.content.strip()
 
     print("======== GENERATED SQL QUERY ========")
@@ -420,6 +506,7 @@ Current User Question:
 
     try:
         sql_result = db.run(generated_sql)
+        _check_cancelled(state)
     except Exception as err:
         sql_result = f"Generated SQL execution error: {err}"
 
@@ -452,6 +539,8 @@ def route_after_nl2sql(state: RAGState) -> str:
 
 def rerank_node(state: RAGState) -> RAGState:
 
+    _check_cancelled(state)
+
     print("========= INSIDE RERANK NODE =========")
 
     co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
@@ -477,6 +566,8 @@ def rerank_node(state: RAGState) -> RAGState:
         documents=[doc.page_content for doc in docs],
         top_n=5,
     )
+
+    _check_cancelled(state)
 
     reranked_docs = [docs[r.index] for r in rerank_response.results]
 
@@ -511,8 +602,10 @@ def merge_context_node(state: RAGState) -> RAGState:
     This node does NOT call an LLM.
     """
 
-    print("========= INSIDE MERGE CONTEXT NODE =========")
+    _check_cancelled(state)
 
+    print("========= INSIDE MERGE CONTEXT NODE =========")
+    _emit_progress("Putting the information together...")
     route = state.get("route")
 
     # ------------------------------------------------------------------------
@@ -592,6 +685,8 @@ Page   : {page_no}
 
 
 def generate_answer_node(state: RAGState) -> RAGState:
+
+    _check_cancelled(state)
 
     print("========= INSIDE GENERATE ANSWER NODE =========")
 
@@ -777,6 +872,8 @@ Previous Evaluation Feedback (if any):
         }
     )
 
+    _check_cancelled(state)
+
     response = result.model_dump()
 
     # Preserve the SQL query generated during this turn.
@@ -794,7 +891,12 @@ Previous Evaluation Feedback (if any):
 
 def evaluate_answer_node(state: RAGState) -> RAGState:
 
+    _check_cancelled(state)
+
     print("========= INSIDE EVALUATE ANSWER NODE =========")
+    if state.get("evaluate_count", 0) == 0:
+
+        _emit_progress("Preparing your answer...")
 
     print("========= ANSWER BEING EVALUATED =========")
     print(state["response"])
@@ -923,6 +1025,8 @@ Previous Evaluation Feedback:
             ),
         }
     )
+
+    _check_cancelled(state)
 
     print("========= EVALUATOR RESULT =========")
     print(f"[evaluate_answer_node] " f"{result.evaluation}")
@@ -1191,10 +1295,12 @@ def run_search_agent(
     query: str,
     thread_id: str,
 ):
-
     print("============ INSIDE run_search_agent ============")
 
+    clear_query_cancellation(thread_id)
+
     initial_state = {
+        "thread_id": thread_id,
         "query": query,
         "messages": [HumanMessage(content=query)],
         "route": "",
@@ -1219,22 +1325,45 @@ def run_search_agent(
         }
     }
 
-    final_state = rag_graph.invoke(
-        initial_state,
-        config=config,
-    )
+    try:
+        final_state = rag_graph.invoke(
+            initial_state,
+            config=config,
+        )
 
-    return final_state["response"]
+        return final_state["response"]
+
+    finally:
+        clear_query_cancellation(thread_id)
+
+
+# ============================================================================
+# STREAMING ENTRY POINT
+# ============================================================================
 
 
 async def run_search_agent_stream(
     query: str,
     thread_id: str,
 ):
+    """
+    Execute the RAG graph while exposing:
 
-    print("============ INSIDE run_search_agent ============")
+    - intermediate progress events from _emit_progress()
+    - final response from the appropriate graph node
+    - cancellation events
+    - errors
+
+    DIRECT queries terminate at the router node.
+    Retrieval queries continue through the normal RAG flow.
+    """
+
+    print("============ INSIDE run_search_agent_stream ============")
+
+    clear_query_cancellation(thread_id)
 
     initial_state = {
+        "thread_id": thread_id,
         "query": query,
         "messages": [HumanMessage(content=query)],
         "route": "",
@@ -1259,17 +1388,161 @@ async def run_search_agent_stream(
         }
     }
 
-    async for event in rag_graph.astream_events(
-        initial_state, config=config, version="v1"
-    ):
-        kind = event["event"]
-        print(kind)
+    final_response = None
+    selected_route = None
 
-        # if it is a token generated by the chat model
-        if kind == "on_chat_model_stream":
-            content = event["data"]["chunk"].content
-            if content:
-                # format as an Server Side Event data straem payload
-                yield f"data: {json.dumps({'token': content})}\n\n"
+    try:
 
-    yield "data: [DONE]\n\n"
+        async for chunk in rag_graph.astream(
+            initial_state,
+            config=config,
+            stream_mode=["custom", "updates"],
+            version="v2",
+        ):
+
+            # ================================================================
+            # CUSTOM EVENTS
+            #
+            # These come directly from _emit_progress()
+            # ================================================================
+
+            if chunk["type"] == "custom":
+
+                data = chunk["data"]
+
+                if isinstance(data, dict) and data.get("event") == "progress":
+
+                    message = data.get(
+                        "message",
+                        "",
+                    )
+
+                    if message:
+
+                        print("[run_search_agent_stream] " f"Progress: {message}")
+
+                        yield {
+                            "event": "progress",
+                            "message": message,
+                        }
+
+                continue
+
+            # ================================================================
+            # NODE UPDATES
+            # ================================================================
+
+            if chunk["type"] != "updates":
+                continue
+
+            updates = chunk["data"]
+
+            if not isinstance(updates, dict):
+                continue
+
+            for node_name, node_update in updates.items():
+
+                if not isinstance(node_update, dict):
+                    continue
+
+                # ============================================================
+                # ROUTER
+                #
+                # DIRECT queries end here.
+                # ============================================================
+
+                if node_name == "router":
+
+                    selected_route = node_update.get("route")
+
+                    print("[run_search_agent_stream] " f"Route: {selected_route}")
+
+                    if selected_route == "DIRECT":
+
+                        response = node_update.get("response")
+
+                        if response:
+
+                            final_response = response
+
+                            print(
+                                "[run_search_agent_stream] " "DIRECT response captured."
+                            )
+
+                # ============================================================
+                # GENERATE ANSWER
+                #
+                # RDBMS / VECTOR / HYBRID queries eventually
+                # produce their response here.
+                # ============================================================
+
+                elif node_name == "generate_answer":
+
+                    response = node_update.get("response")
+
+                    if response:
+
+                        final_response = response
+
+                        print("[run_search_agent_stream] " "Answer generated.")
+
+                # ============================================================
+                # OTHER NODE RESPONSES
+                #
+                # If a future node directly produces the final response,
+                # this allows us to capture it without changing the design.
+                # ============================================================
+
+                elif "response" in node_update:
+
+                    response = node_update.get("response")
+
+                    if response:
+
+                        final_response = response
+
+            # ================================================================
+            # CANCELLATION
+            # ================================================================
+
+            raise_if_query_cancelled(thread_id)
+
+        # ====================================================================
+        # FINAL RESPONSE
+        # ====================================================================
+
+        if final_response is None:
+
+            raise RuntimeError(
+                "The RAG pipeline completed " "without producing a response."
+            )
+
+        print("[run_search_agent_stream] " f"Final route: {selected_route}")
+
+        yield {
+            "event": "final",
+            "data": final_response,
+        }
+
+    except QueryCancelled:
+
+        print("[run_search_agent_stream] " f"Query cancelled: {thread_id}")
+
+        yield {
+            "event": "cancelled",
+            "message": "The query was stopped.",
+        }
+
+    except Exception as exc:
+
+        print("[run_search_agent_stream] " f"Streaming query failed: {exc}")
+
+        yield {
+            "event": "error",
+            "status_code": 500,
+            "message": ("Unable to process your question. " "Please try again."),
+        }
+
+    finally:
+
+        clear_query_cancellation(thread_id)

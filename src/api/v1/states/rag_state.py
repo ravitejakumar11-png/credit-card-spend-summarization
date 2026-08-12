@@ -6,6 +6,7 @@ from langgraph.graph.message import add_messages
 
 class RAGState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
+    thread_id: str
     query: str
     route: str
     retrieval_query: str
