@@ -1134,6 +1134,7 @@ def similarity_search(
 
     sql = f"""
         SELECT
+            id,
             content,
             chunk_type,
             page_number,
@@ -1179,6 +1180,158 @@ def similarity_search(
 
     # -----------------------------------------------------------------------
     # Load images from filesystem.
+    # -----------------------------------------------------------------------
+
+    results = []
+
+    for row in rows:
+
+        row = dict(row)
+
+        image_path = row.pop(
+            "image_path",
+            None,
+        )
+
+        if image_path and os.path.exists(image_path):
+
+            try:
+
+                row["image_base64"] = base64.b64encode(
+                    pathlib.Path(image_path).read_bytes()
+                ).decode()
+
+            except OSError as exc:
+
+                print(f"[db] Failed to read image " f"{image_path}: {exc}")
+
+                row["image_base64"] = None
+
+        else:
+
+            row["image_base64"] = None
+
+        results.append(row)
+
+    return results
+
+
+# ===========================================================================
+# Full Text Search
+# ===========================================================================
+
+
+def fts_search(
+    query: str,
+    k: int = 20,
+    chunk_type: str | None = None,
+) -> list[dict]:
+    """
+    Perform PostgreSQL Full Text Search against multimodal_chunks.
+
+    The tsvector is calculated at query time. No additional
+    column or index is required for the current small dataset.
+    """
+
+    if not query or not query.strip():
+        raise ValueError("Search query cannot be empty.")
+
+    if k <= 0:
+        raise ValueError("k must be greater than zero.")
+
+    if chunk_type not in (
+        None,
+        "text",
+        "table",
+        "image",
+    ):
+        raise ValueError("chunk_type must be one of: " "text, table, image.")
+
+    # -----------------------------------------------------------------------
+    # Optional chunk-type filter.
+    # -----------------------------------------------------------------------
+
+    type_clause = "AND chunk_type = %(chunk_type)s" if chunk_type else ""
+
+    # -----------------------------------------------------------------------
+    # PostgreSQL Full Text Search.
+    #
+    # We deliberately calculate tsvector at runtime because the table
+    # currently contains only ~100-200 rows.
+    # -----------------------------------------------------------------------
+
+    sql = f"""
+        SELECT
+            id,
+            content,
+            chunk_type,
+            page_number,
+            section,
+            source_file,
+            element_type,
+            image_path,
+            mime_type,
+            position,
+            metadata,
+
+            ts_rank(
+                to_tsvector(
+                    'english',
+                    coalesce(content, '')
+                ),
+                plainto_tsquery(
+                    'english',
+                    %(query)s
+                )
+            ) AS fts_rank
+
+        FROM multimodal_chunks
+
+        WHERE
+            to_tsvector(
+                'english',
+                coalesce(content, '')
+            )
+            @@
+            plainto_tsquery(
+                'english',
+                %(query)s
+            )
+
+            {type_clause}
+
+        ORDER BY fts_rank DESC
+
+        LIMIT %(k)s
+    """
+
+    try:
+
+        with get_db_conn() as conn:
+
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    sql,
+                    {
+                        "query": query,
+                        "chunk_type": chunk_type,
+                        "k": k,
+                    },
+                )
+
+                rows = cur.fetchall()
+
+    except Exception as exc:
+
+        print("[db] FTS search failed: " f"{exc}")
+
+        raise
+
+    # -----------------------------------------------------------------------
+    # Load images from filesystem.
+    #
+    # Keep this consistent with similarity_search().
     # -----------------------------------------------------------------------
 
     results = []
@@ -1388,6 +1541,7 @@ def search_vector_store(
             Document(
                 page_content=row["content"],
                 metadata={
+                    "chunk_id": row.get("id"),
                     "source": row.get("source_file"),
                     "page": row.get("page_number"),
                     "section": row.get("section"),
