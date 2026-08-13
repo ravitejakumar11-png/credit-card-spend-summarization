@@ -27,3 +27,5 @@ class RAGState(TypedDict):
     evaluation: str
     evaluation_feedback: str
     evaluate_count: int
+    user_preference: str
+    user_id: str

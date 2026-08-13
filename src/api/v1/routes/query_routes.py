@@ -27,6 +27,7 @@ def query_endpoint(
         return query_documents(
             query=request.query,
             thread_id=request.thread_id,
+            user_id=request.user_id,
         )
 
     except EmbeddingServiceError as exc:
@@ -66,6 +67,7 @@ async def stream_query_endpoint(
             async for event in query_documents_stream(
                 query=request.query,
                 thread_id=request.thread_id,
+                user_id=request.user_id,
             ):
                 yield (f"data: " f"{json.dumps(event, ensure_ascii=False)}" "\n\n")
 
