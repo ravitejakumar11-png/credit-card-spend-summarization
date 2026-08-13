@@ -642,7 +642,7 @@ for message in st.session_state.chat_history:
 # ============================================================================
 
 
-@st.fragment(run_every="1s")
+@st.fragment(run_every=0.2)
 def active_query_fragment():
 
     if not st.session_state.query_running:
@@ -678,67 +678,14 @@ def active_query_fragment():
                 if token:
                     st.session_state.streaming_answer += token
 
+            elif event_type == "reset":
+                # Evaluation may request a regeneration. The backend sends
+                # reset before the replacement answer starts so the UI does
+                # not concatenate the rejected answer with the new one.
+                st.session_state.streaming_answer = ""
+
         if latest_progress:
             st.session_state.query_progress = latest_progress
-
-    # ------------------------------------------------------------------------
-    # Processing indicator
-    # ------------------------------------------------------------------------
-
-    if st.session_state.query_cancel_requested:
-        st.info("Stopping your request...")
-    else:
-        progress_message = (
-            st.session_state.query_progress or "Processing your question..."
-        )
-        st.info(progress_message)
-
-    # ------------------------------------------------------------------------
-    # Live streamed answer
-    # ------------------------------------------------------------------------
-
-    if st.session_state.streaming_answer:
-        with st.chat_message("assistant"):
-            st.markdown(st.session_state.streaming_answer)
-
-    # ------------------------------------------------------------------------
-    # Stop button
-    # ------------------------------------------------------------------------
-
-    if st.session_state.query_cancel_requested:
-        st.button(
-            "⏹ Stopping...",
-            disabled=True,
-            use_container_width=True,
-        )
-    else:
-        if st.button(
-            "⏹ Stop",
-            use_container_width=True,
-        ):
-            print("========== QUERY CANCELLATION REQUEST ==========")
-            print(f"Thread ID : {st.session_state.thread_id!r}")
-
-            try:
-                response = requests.post(
-                    f"{API_BASE_URL}/api/v1/query/cancel/"
-                    f"{st.session_state.thread_id}",
-                    timeout=10,
-                )
-
-                if response.ok:
-                    print("[ui] Cancellation requested.")
-                    st.session_state.query_cancel_requested = True
-                    st.rerun()
-                else:
-                    st.error(
-                        "Unable to stop the query: "
-                        f"{response.status_code} - "
-                        f"{response.text}"
-                    )
-
-            except requests.RequestException as exc:
-                st.error("Could not connect to the " f"{API_BASE_URL} server: {exc}")
 
     # ------------------------------------------------------------------------
     # Get background future
@@ -750,6 +697,87 @@ def active_query_fragment():
         st.session_state.query_running = False
         st.session_state.query_error = "The query could not be started."
         st.rerun()
+
+    # ------------------------------------------------------------------------
+    # Query is still running
+    #
+    # IMPORTANT:
+    # Check future.done() BEFORE rendering the progress message.
+    #
+    # This prevents a stale "Preparing your answer..." message from being
+    # rendered during the final fragment execution after the backend has
+    # already completed.
+    # ------------------------------------------------------------------------
+
+    if not future.done():
+
+        # ------------------------------------------------------------------------
+        # Processing indicator
+        #
+        # Once answer tokens have started arriving, hide the progress message.
+        # The streamed answer becomes the primary UI at that point.
+        # ------------------------------------------------------------------------
+
+        if not st.session_state.streaming_answer:
+
+            if st.session_state.query_cancel_requested:
+                st.info("Stopping your request...")
+            else:
+                progress_message = (
+                    st.session_state.query_progress or "Processing your question..."
+                )
+                st.info(progress_message)
+
+        # --------------------------------------------------------------------
+        # Live streamed answer
+        # --------------------------------------------------------------------
+
+        if st.session_state.streaming_answer:
+            with st.chat_message("assistant"):
+                st.markdown(st.session_state.streaming_answer)
+
+        # --------------------------------------------------------------------
+        # Stop button
+        # --------------------------------------------------------------------
+
+        if st.session_state.query_cancel_requested:
+            st.button(
+                "⏹ Stopping...",
+                disabled=True,
+                use_container_width=True,
+            )
+        else:
+            if st.button(
+                "⏹ Stop",
+                use_container_width=True,
+            ):
+                print("========== QUERY CANCELLATION REQUEST ==========")
+                print(f"Thread ID : {st.session_state.thread_id!r}")
+
+                try:
+                    response = requests.post(
+                        f"{API_BASE_URL}/api/v1/query/cancel/"
+                        f"{st.session_state.thread_id}",
+                        timeout=10,
+                    )
+
+                    if response.ok:
+                        print("[ui] Cancellation requested.")
+                        st.session_state.query_cancel_requested = True
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Unable to stop the query: "
+                            f"{response.status_code} - "
+                            f"{response.text}"
+                        )
+
+                except requests.RequestException as exc:
+                    st.error(
+                        "Could not connect to the " f"{API_BASE_URL} server: {exc}"
+                    )
+
+        return
 
     # ------------------------------------------------------------------------
     # Query is still running
@@ -773,6 +801,32 @@ def active_query_fragment():
                 "your question. Please try again."
             ),
         }
+
+    # ------------------------------------------------------------------------
+    # Drain any token/reset events that arrived immediately before completion.
+    # This closes the small race between the worker receiving the final SSE
+    # event and this fragment observing future.done().
+    # ------------------------------------------------------------------------
+
+    if progress_queue is not None:
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if not isinstance(event, dict):
+                continue
+
+            event_type = event.get("event")
+
+            if event_type == "token":
+                token = event.get("content", "")
+                if token:
+                    st.session_state.streaming_answer += token
+
+            elif event_type == "reset":
+                st.session_state.streaming_answer = ""
 
     # ------------------------------------------------------------------------
     # Capture cancellation state BEFORE resetting it.
