@@ -4,22 +4,21 @@ from src.api.v1.agents.agents import (
 )
 
 
-def query_documents(
-    query: str,
-    thread_id: str,
-):
+def query_documents(query: str, thread_id: str, user_id: str | None = None):
     print(query)
     print(f"thread_id: {thread_id}")
 
     return run_search_agent(
         query=query,
         thread_id=thread_id,
+        user_id=user_id,
     )
 
 
 async def query_documents_stream(
     query: str,
     thread_id: str | None = None,
+    user_id: str | None = None,
 ):
     print(query)
     print(f"thread_id: {thread_id}")
@@ -27,5 +26,6 @@ async def query_documents_stream(
     async for event in run_search_agent_stream(
         query=query,
         thread_id=thread_id,
+        user_id=user_id,
     ):
         yield event

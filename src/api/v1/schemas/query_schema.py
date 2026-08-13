@@ -9,6 +9,10 @@ class QueryRequest(BaseModel):
         default=None,
         description="Conversation thread identifier used to maintain chat context",
     )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="User identifier used to maintain user context",
+    )
 
 
 # query api endpoint response format

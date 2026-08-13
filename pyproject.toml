@@ -13,6 +13,7 @@ dependencies = [
     "langchain-openai>=1.4.1",
     "langchain-postgres>=0.0.17",
     "langgraph>=1.2.10",
+    "mem0ai>=2.0.18",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.32",
     "streamlit>=1.61.1",
