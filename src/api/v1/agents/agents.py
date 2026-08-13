@@ -28,12 +28,12 @@ from src.api.v1.services.query_cancellation import (
     clear_query_cancellation,
     QueryCancelled,
 )
+from mem0 import MemoryClient
 
 load_dotenv()
 
 
 def _check_cancelled(state: RAGState) -> None:
-
     thread_id = state.get("thread_id")
 
     raise_if_query_cancelled(thread_id)
@@ -136,6 +136,14 @@ def _get_evaluator_llm():
     )
 
 
+client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
+
+
+# ============================================================================
+# STRUCTURED OUTPUT MODELS
+# ============================================================================
+
+
 class RouteDecision(BaseModel):
     route: Literal[
         "VECTOR_DB",
@@ -148,7 +156,6 @@ class RouteDecision(BaseModel):
 
 
 class KnowledgeStrategyDecision(BaseModel):
-
     knowledge_strategy: Literal[
         "VECTOR",
         "FTS",
@@ -163,7 +170,6 @@ class KnowledgeStrategyDecision(BaseModel):
 
 
 class RetrievalQueryDecision(BaseModel):
-
     retrieval_query: str
 
     fts_query: str
@@ -174,6 +180,287 @@ class EvaluationDecision(BaseModel):
     feedback: str
 
 
+class UserPreferenceDecision(BaseModel):
+    is_preference: bool
+    preference: str
+
+
+def save_user_preference_to_mem0(
+    preference: str,
+    user_id: str,
+) -> None:
+
+    if not preference:
+        return
+
+    try:
+
+        messages = [
+            {
+                "role": "user",
+                "content": preference,
+            }
+        ]
+
+        client.add(
+            messages,
+            user_id=user_id,
+        )
+
+        print("[Mem0] Preference saved successfully: " f"{preference}")
+
+    except Exception as exc:
+
+        # Memory failure should NOT break the RAG pipeline.
+        print("[Mem0] Failed to save preference: " f"{exc}")
+
+
+def retrieve_user_preferences_from_mem0(
+    query: str,
+    user_id: str,
+    top_k: int = 5,
+) -> str:
+    """
+    Retrieve the user's previously stored preferences from Mem0.
+
+    The search is always scoped to the authenticated user_id so memories
+    from another user can never be used as personalization context.
+
+    Returns a compact newline-separated string suitable for an LLM prompt.
+    Memory retrieval is best-effort and must never break the RAG pipeline.
+    """
+
+    if not user_id:
+        return ""
+
+    try:
+        results = client.search(
+            query=(
+                "User preferences, likes, dislikes, habits, choices, "
+                "defaults, and constraints relevant to this request. "
+                f"Current request: {query}"
+            ),
+            filters={"user_id": user_id},
+            top_k=top_k,
+        )
+
+        # Mem0 Platform responses can be returned either as a list or as an
+        # envelope containing a `results` list depending on SDK/API version.
+        if isinstance(results, dict):
+            memories = results.get("results", [])
+        else:
+            memories = results or []
+
+        preferences = []
+        seen = set()
+
+        for item in memories:
+            if isinstance(item, dict):
+                memory = item.get("memory", "")
+            else:
+                memory = getattr(item, "memory", "")
+
+            if not memory:
+                continue
+
+            memory = str(memory).strip()
+            if not memory or memory in seen:
+                continue
+
+            seen.add(memory)
+            preferences.append(memory)
+
+        if not preferences:
+            print(f"[Mem0] No stored preferences found for user_id={user_id}")
+            return ""
+
+        formatted = "\n".join(f"- {preference}" for preference in preferences)
+
+        print(
+            "[Mem0] Retrieved "
+            f"{len(preferences)} preference(s) for user_id={user_id}"
+        )
+
+        return formatted
+
+    except Exception as exc:
+        print("[Mem0] Failed to retrieve preferences: " f"{exc}")
+        return ""
+
+
+def detect_user_preference(
+    query: str,
+    history: list,
+) -> UserPreferenceDecision:
+
+    llm = _get_router_llm()
+
+    structured_llm = llm.with_structured_output(UserPreferenceDecision)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+You are a user-preference detection component for the
+NorthStar Credit Card Assistant.
+
+Your task is to determine whether the user's current message
+contains information that should be remembered as a long-term
+user preference, like, dislike, habit, choice, or personal
+preference.
+
+A preference should be stored when the user explicitly or
+implicitly tells the assistant something they like, dislike,
+prefer, usually do, or want the assistant to remember.
+
+Examples that SHOULD be remembered:
+
+- "I prefer cashback cards."
+- "I like earning travel rewards."
+- "I don't like annual-fee cards."
+- "I prefer Visa cards."
+- "I usually use my card for dining."
+- "I prefer to redeem my points for flights."
+- "I don't want recommendations involving annual fees."
+- "I prefer concise answers."
+- "I like airport lounge benefits."
+
+Examples that SHOULD NOT be remembered:
+
+- "What are the benefits of this card?"
+- "How many points did I earn?"
+- "What is my balance?"
+- "What is the annual fee?"
+- "Tell me about lounge access."
+- "Hello."
+- "What can you do?"
+- Temporary instructions that only apply to the current request.
+
+Important rules:
+
+1. Only extract information actually stated or clearly implied
+   by the user.
+2. Do not invent preferences.
+3. Do not store ordinary questions as preferences.
+4. Do not store sensitive personal information.
+5. Keep the preference concise and written as a statement
+   about the user.
+6. If multiple preferences are expressed, combine them into
+   one concise preference string.
+7. If there is no preference, return an empty string.
+8. Do not answer the user's question.
+
+Return:
+
+- is_preference
+- preference
+""",
+            ),
+            (
+                "human",
+                """
+Conversation History:
+
+{history}
+
+Current User Message:
+
+{query}
+""",
+            ),
+        ]
+    )
+
+    chain = prompt | structured_llm
+
+    return chain.invoke(
+        {
+            "history": history,
+            "query": query,
+        }
+    )
+
+
+def memory_node(state: RAGState) -> RAGState:
+    """
+    Manage long-term user memory before route selection.
+
+    Flow:
+        1. Detect a new preference in the current user message.
+        2. Save the new preference to Mem0.
+        3. Search Mem0 for the authenticated user's existing preferences.
+        4. Put the retrieved preferences into RAGState.UserPreference.
+
+    The retrieved preference string is later supplied separately to the
+    answer generator and evaluator as personalization context.
+    """
+
+    _check_cancelled(state)
+
+    print("========= INSIDE MEMORY NODE =========")
+
+    query = state["query"]
+    history = state.get("messages", [])
+    user_id = state.get("user_id")
+
+    if not user_id:
+        print(
+            "[memory_node] No authenticated user_id found. " "Skipping Mem0 operations."
+        )
+        return {"UserPreference": ""}
+
+    # ------------------------------------------------------------
+    # 1. Detect a newly expressed preference.
+    # ------------------------------------------------------------
+
+    preference_decision = detect_user_preference(
+        query=query,
+        history=history,
+    )
+
+    _check_cancelled(state)
+
+    if (
+        preference_decision.is_preference
+        and preference_decision.preference
+        and preference_decision.preference.strip()
+    ):
+        new_preference = preference_decision.preference.strip()
+
+        print("[memory_node] New user preference detected: " f"{new_preference}")
+
+        save_user_preference_to_mem0(
+            preference=new_preference,
+            user_id=user_id,
+        )
+    else:
+        print("[memory_node] No new user preference detected.")
+
+    _check_cancelled(state)
+
+    # ------------------------------------------------------------
+    # 2. Retrieve existing preferences for this authenticated user.
+    # ------------------------------------------------------------
+
+    user_preferences = retrieve_user_preferences_from_mem0(
+        query=query,
+        user_id=user_id,
+        top_k=5,
+    )
+
+    _check_cancelled(state)
+
+    return {
+        "UserPreference": user_preferences,
+    }
+
+
+# ============================================================================
+# ROUTER
+# ============================================================================
+
+
 def router_node(state: RAGState) -> RAGState:
 
     _check_cancelled(state)
@@ -182,7 +469,11 @@ def router_node(state: RAGState) -> RAGState:
 
     _emit_progress("Understanding your question...")
 
+    history = state.get("messages", [])
+    query = state["query"]
+
     llm = _get_router_llm()
+
     structured_llm = llm.with_structured_output(RouteDecision)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -204,7 +495,6 @@ Use when the answer requires information from the credit-card knowledge base, in
 - Fees, interest, billing, EMI, eligibility
 - Policies, FAQs, terms & conditions
 - Product documentation or bank rules
-
 
 2. RDBMS
 
@@ -238,7 +528,6 @@ Examples:
 - "How many points did I earn for dining last month?" → RDBMS
 - "What is the dining reward rate?" → VECTOR_DB
 
-
 3. HYBRID
 
 Use when BOTH the relational database and knowledge base are required.
@@ -258,7 +547,6 @@ Use HYBRID only when the answer genuinely requires BOTH:
 
 Do not use HYBRID merely because the question mentions rewards,
 spending, fees, or another topic that exists in both sources.
-
 
 4. DIRECT
 
@@ -341,6 +629,7 @@ Current User Question:
         _emit_progress("Checking the relevant card information...")
 
     print(f"[router_node] Route : {decision.route}")
+
     print(f"[router_node] Reason: {decision.reason}")
 
     return {
@@ -356,6 +645,30 @@ Current User Question:
     }
 
 
+# ============================================================================
+# HYBRID START / JOIN
+# ============================================================================
+
+
+def hybrid_start_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE HYBRID START NODE =========")
+
+    return {}
+
+
+def hybrid_join_node(state: RAGState) -> RAGState:
+
+    print("========= INSIDE HYBRID JOIN NODE =========")
+
+    return {}
+
+
+# ============================================================================
+# KNOWLEDGE STRATEGY ROUTER
+# ============================================================================
+
+
 def knowledge_strategy_router_node(state: RAGState) -> RAGState:
 
     print("====== INSIDE KNOWLEDGE STRATEGY ROUTER ======")
@@ -365,6 +678,7 @@ def knowledge_strategy_router_node(state: RAGState) -> RAGState:
     _emit_progress("Understanding the question...")
 
     llm = _get_router_llm()
+
     structured_llm = llm.with_structured_output(KnowledgeStrategyDecision)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -381,6 +695,7 @@ Available strategies:
 1. VECTOR
 
 Use VECTOR when:
+
 - The user is asking for explanation, reasoning, summary, or conceptual understanding.
 - The answer requires semantic understanding.
 - The wording may not exactly match the document.
@@ -390,10 +705,10 @@ Examples:
 "Explain reward redemption rules"
 "How does billing work?"
 
-
 2. FTS
 
 Use FTS when:
+
 - Exact words, phrases, identifiers, names, codes, or specific terms matter.
 - The user is looking for an exact mention in documents.
 
@@ -402,10 +717,10 @@ Examples:
 "Where is Statement Credit mentioned?"
 "Find Platinum card"
 
-
 3. VECTOR_FTS
 
 Use VECTOR_FTS when:
+
 - The query needs both semantic understanding and exact terminology matching.
 - The question is complex or policy/rule based.
 - Missing either semantic or keyword retrieval may reduce recall.
@@ -445,7 +760,6 @@ retrieval_query:
 "NorthStar credit card reward points redemption options,
 conversion values, and redemption methods"
 
-
 ================================================
 
 fts_query:
@@ -469,26 +783,27 @@ User:
 fts_query:
 "MCC Merchant Category Code"
 
-
 ================================================
 
 For VECTOR strategy:
 
 Generate:
+
 - retrieval_query
 
 Set:
-- fts_query as empty string
 
+- fts_query as empty string
 
 For FTS strategy:
 
 Generate:
+
 - fts_query
 
 Set:
-- retrieval_query as empty string
 
+- retrieval_query as empty string
 
 For VECTOR_FTS strategy:
 
@@ -519,6 +834,7 @@ Do not choose FTS only because the question contains
 common words like "credit", "card", "reward", or "payment".
 
 Rules:
+
 - Return ONLY JSON.
 - Do not add explanations.
 
@@ -584,18 +900,9 @@ Current User Question:
     }
 
 
-def hybrid_start_node(state: RAGState) -> RAGState:
-
-    print("========= INSIDE HYBRID START NODE =========")
-
-    return {}
-
-
-def hybrid_join_node(state: RAGState) -> RAGState:
-
-    print("========= INSIDE HYBRID JOIN NODE =========")
-
-    return {}
+# ============================================================================
+# QUERY OPTIMIZATION / REFORMULATION
+# ============================================================================
 
 
 def query_optimization_node(state: RAGState) -> RAGState:
@@ -605,6 +912,7 @@ def query_optimization_node(state: RAGState) -> RAGState:
     print("========= INSIDE QUERY REFORMULATION NODE =========")
 
     llm = _get_router_llm()
+
     structured_llm = llm.with_structured_output(RetrievalQueryDecision)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -635,6 +943,7 @@ VECTOR strategy:
 Create only a semantic retrieval query.
 
 The query should:
+
 - capture the meaning of the question
 - add useful banking or credit-card terminology
 - expand concepts when helpful
@@ -655,6 +964,7 @@ FTS strategy:
 Create only a lexical search query.
 
 The query should:
+
 - preserve exact terms
 - preserve acronyms
 - preserve product names
@@ -671,7 +981,6 @@ Question:
 fts_query:
 "MCC Merchant Category Code"
 
-
 Question:
 "Where is Statement Credit mentioned?"
 
@@ -685,10 +994,12 @@ VECTOR_FTS strategy:
 Create BOTH queries.
 
 retrieval_query:
+
 - semantic query for vector similarity search
 - include context and meaning
 
 fts_query:
+
 - keyword-focused query for PostgreSQL FTS
 - preserve exact document terminology
 
@@ -758,6 +1069,11 @@ Retrieval Strategy:
     }
 
 
+# ============================================================================
+# NL2SQL
+# ============================================================================
+
+
 def nl2sql_node(state: RAGState) -> RAGState:
 
     _check_cancelled(state)
@@ -797,14 +1113,22 @@ conversation history.
 ## SQL Rules
 
 - Use only tables and columns present in the supplied schema.
+
 - Generate only the SQL required to answer the question.
+
 - Return ONLY raw SQL. No explanation, markdown or code fences.
+
 - SELECT statements only.
+
 - Never generate INSERT, UPDATE, DELETE, DROP or other DML/DDL.
+
 - Add LIMIT 50 unless the query is an aggregate.
+
 - For multi-word text searches, search meaningful keywords separately
   rather than requiring the entire phrase to match.
+
 - Use appropriate synonyms when useful for text searches.
+
 Reward points have multiple meanings in the database:
 
 - credit_cards.reward_points:
@@ -872,17 +1196,27 @@ Current User Question:
     generated_sql = raw_sql.content.strip()
 
     print("======== GENERATED SQL QUERY ========")
+
     print(generated_sql)
 
+    _check_cancelled(state)
+
     try:
+
         sql_result = db.run(generated_sql)
+
         _check_cancelled(state)
+
     except Exception as err:
+
         sql_result = f"Generated SQL execution error: {err}"
 
     print("========= NL2SQL NODE OUTPUT =========")
+
     print("\nSQL Result:")
+
     print(str(sql_result))
+
     print("======================================")
 
     # IMPORTANT:
@@ -902,9 +1236,15 @@ Current User Question:
 def route_after_nl2sql(state: RAGState) -> str:
 
     if state["route"] == "HYBRID":
+
         return "HYBRID"
 
     return "RDBMS"
+
+
+# ============================================================================
+# RERANK
+# ============================================================================
 
 
 def rerank_node(state: RAGState) -> RAGState:
@@ -918,6 +1258,7 @@ def rerank_node(state: RAGState) -> RAGState:
     docs = state.get("retrieved_docs", [])
 
     if not docs:
+
         print("[rerank_node] No documents to rerank.")
 
         return {
@@ -927,7 +1268,9 @@ def rerank_node(state: RAGState) -> RAGState:
     search_query = state.get("retrieval_query") or state["query"]
 
     print("======= BEFORE CALLING RERANKER =======")
+
     print(f"Search query: {search_query}")
+
     print(f"Documents   : {len(docs)}")
 
     rerank_response = co.rerank(
@@ -959,12 +1302,20 @@ def rerank_node(state: RAGState) -> RAGState:
 def route_after_rerank(state: RAGState) -> str:
 
     if state["route"] == "HYBRID":
+
         return "HYBRID"
 
     return "VECTOR_DB"
 
 
-def merge_context_node(state: RAGState) -> RAGState:
+# ============================================================================
+# MERGE CONTEXT
+# ============================================================================
+
+
+def merge_context_node(
+    state: RAGState,
+) -> RAGState:
     """
     Merge SQL results and Vector search results into one context
     for answer generation.
@@ -975,7 +1326,9 @@ def merge_context_node(state: RAGState) -> RAGState:
     _check_cancelled(state)
 
     print("========= INSIDE MERGE CONTEXT NODE =========")
+
     _emit_progress("Putting the information together...")
+
     route = state.get("route")
 
     # ------------------------------------------------------------------------
@@ -1036,16 +1389,20 @@ Page   : {page_no}
     contexts = []
 
     if sql_context:
+
         contexts.append(sql_context)
 
     if vector_context:
+
         contexts.append(vector_context)
 
     final_context = "\n\n".join(contexts)
 
     print(f"Route                  : {route}")
-    print(f"SQL Context Present    : " f"{bool(sql_context)}")
-    print(f"Vector Context Present : " f"{bool(vector_context)}")
+
+    print("SQL Context Present    : " f"{bool(sql_context)}")
+
+    print("Vector Context Present : " f"{bool(vector_context)}")
 
     return {
         "sql_context": sql_context,
@@ -1055,7 +1412,6 @@ Page   : {page_no}
 
 
 def generate_answer_node(state: RAGState, config=None) -> RAGState:
-
     _check_cancelled(state)
 
     print("========= INSIDE GENERATE ANSWER NODE =========")
@@ -1109,10 +1465,6 @@ are present and both are relevant, combine them.
 
 Do not invent information.
 
-==================================================
-SOURCE ACCURACY
-==================================================
-
 Answer using only the supplied context.
 
 Preserve the exact meaning and scope of the source.
@@ -1142,10 +1494,6 @@ into:
 When a table and an explanatory note appear together, interpret them
 together and preserve both the earning rule and its exceptions.
 
-==================================================
-CONVERSATION
-==================================================
-
 Use conversation history to resolve references such as:
 
 - he
@@ -1161,10 +1509,6 @@ Use conversation history to resolve references such as:
 
 Do not lose entities established in previous turns.
 
-==================================================
-RESPONSE STYLE
-==================================================
-
 - Be concise and business-friendly.
 - Use bullets when useful.
 - Explain numerical results clearly.
@@ -1173,10 +1517,6 @@ RESPONSE STYLE
 - Do not expose internal processing details.
 - If the context does not contain enough information to answer,
   clearly say that the available information is insufficient.
-
-==================================================
-RESPONSE FIELDS
-==================================================
 
 Populate:
 
@@ -1217,6 +1557,17 @@ Current User Question:
 Retrieved Context:
 
 {context}
+
+User Preference Memory (personalization context only):
+
+{user_preferences}
+
+Important: User Preference Memory describes the user's preferences,
+likes, dislikes, habits, or defaults. It may be used to personalize
+recommendations and presentation, but it is NOT an authoritative source
+for balances, transactions, fees, reward rules, policies, eligibility,
+or any other factual product/customer information. Retrieved Context
+remains the factual authority for those claims.
 
 Previous Evaluation Feedback (if any):
 
@@ -1409,8 +1760,15 @@ Populate the remaining response fields from the supplied context.
     result = chain.invoke(
         {
             "query": state["query"],
-            "context": state.get("final_context", ""),
+            "context": state.get(
+                "final_context",
+                "",
+            ),
             "history": history,
+            "user_preferences": state.get(
+                "UserPreference",
+                "",
+            ),
             "feedback": state.get(
                 "evaluation_feedback",
                 "",
@@ -1425,7 +1783,9 @@ Populate the remaining response fields from the supplied context.
     # Preserve the SQL query generated during this turn.
     #
     # This is useful for RDBMS and HYBRID responses.
+
     if state.get("generated_sql"):
+
         response["sql_query_executed"] = state["generated_sql"]
 
     print("[generate_answer_node] Answer generated.")
@@ -1435,7 +1795,14 @@ Populate the remaining response fields from the supplied context.
     }
 
 
-def evaluate_answer_node(state: RAGState) -> RAGState:
+# ============================================================================
+# EVALUATE ANSWER
+# ============================================================================
+
+
+def evaluate_answer_node(
+    state: RAGState,
+) -> RAGState:
 
     _check_cancelled(state)
 
@@ -1445,9 +1812,16 @@ def evaluate_answer_node(state: RAGState) -> RAGState:
     #     _emit_progress("Preparing your answer...")
 
     print("========= ANSWER BEING EVALUATED =========")
+
     print(state["response"])
 
-    evaluate_count = state.get("evaluate_count", 0) + 1
+    evaluate_count = (
+        state.get(
+            "evaluate_count",
+            0,
+        )
+        + 1
+    )
 
     print(f"Evaluation attempt number: " f"{evaluate_count}")
 
@@ -1529,6 +1903,17 @@ Retrieved Context:
 
 {context}
 
+User Preference Memory (personalization context only):
+
+{user_preferences}
+
+Important: User Preference Memory may explain the user's preferences
+or desired personalization. It must NOT be used as factual evidence
+for balances, transactions, fees, reward rules, policies, eligibility,
+or other product/customer facts. Evaluate factual claims against the
+Retrieved Context. Use preferences only to determine whether the answer
+appropriately respects the user's stated preferences when relevant.
+
 Generated Answer:
 
 {answer}
@@ -1554,6 +1939,7 @@ Previous Evaluation Feedback:
     )
 
     print("========= ANSWER SENT TO EVALUATOR =========")
+
     print(answer)
 
     result = chain.invoke(
@@ -1564,6 +1950,10 @@ Previous Evaluation Feedback:
                 "",
             ),
             "history": history,
+            "user_preferences": state.get(
+                "UserPreference",
+                "",
+            ),
             "answer": answer,
             "feedback": state.get(
                 "evaluation_feedback",
@@ -1575,7 +1965,9 @@ Previous Evaluation Feedback:
     _check_cancelled(state)
 
     print("========= EVALUATOR RESULT =========")
+
     print(f"[evaluate_answer_node] " f"{result.evaluation}")
+
     print(result)
 
     # ----------------------------------------------------------
@@ -1598,12 +1990,24 @@ Previous Evaluation Feedback:
 
     if is_final_answer:
 
-        answer = state.get("response", {}).get("answer", "")
+        answer = state.get(
+            "response",
+            {},
+        ).get(
+            "answer",
+            "",
+        )
 
         if answer:
+
             update["messages"] = [AIMessage(content=answer)]
 
     return update
+
+
+# ============================================================================
+# RETRIEVAL QUALITY
+# ============================================================================
 
 
 def should_reformulate_after_search(
@@ -1630,6 +2034,7 @@ def should_reformulate_after_search(
     # ------------------------------------------------------------------
 
     if attempt >= 2:
+
         return False
 
     # ------------------------------------------------------------------
@@ -1653,6 +2058,7 @@ def should_reformulate_after_search(
     if strategy == "VECTOR":
 
         score_key = "similarity"
+
         threshold = 0.50
 
     elif strategy == "FTS":
@@ -1661,6 +2067,7 @@ def should_reformulate_after_search(
 
         # FTS scores are much smaller than vector similarity scores.
         # Tune this based on your observed PostgreSQL ts_rank values.
+
         threshold = 0.05
 
     elif strategy == "VECTOR_FTS":
@@ -1679,6 +2086,7 @@ def should_reformulate_after_search(
         )
 
         score_key = "similarity"
+
         threshold = 0.50
 
     # ------------------------------------------------------------------
@@ -1730,9 +2138,15 @@ def route_after_retrieval(
 ) -> str:
 
     if should_reformulate_after_search(state):
+
         return "OPTIMIZE"
 
     return "CONTINUE"
+
+
+# ============================================================================
+# ROUTING HELPERS
+# ============================================================================
 
 
 def route_after_evaluation(
@@ -1740,9 +2154,17 @@ def route_after_evaluation(
 ) -> str:
 
     if state.get("evaluation") == "PASS":
+
         return "PASS"
 
-    if state.get("evaluate_count", 0) == 1:
+    if (
+        state.get(
+            "evaluate_count",
+            0,
+        )
+        == 1
+    ):
+
         return "REGENERATE"
 
     return "END"
@@ -1753,12 +2175,15 @@ def route_knowledge_strategy(state: RAGState):
     strategy = state.get("knowledge_strategy")
 
     if strategy == "VECTOR":
+
         return "VECTOR"
 
     if strategy == "FTS":
+
         return "FTS"
 
     if strategy == "VECTOR_FTS":
+
         return "VECTOR_FTS"
 
     return "VECTOR"
@@ -1770,7 +2195,7 @@ def route_after_reformulation(
 
     strategy = state.get("knowledge_strategy")
 
-    print(f"[route_after_reformulation] Strategy: {strategy}")
+    print(f"[route_after_reformulation] " f"Strategy: {strategy}")
 
     if strategy == "FTS":
 
@@ -1783,22 +2208,43 @@ def route_after_reformulation(
     return "vector_search"
 
 
-def increment_retrieval_attempt_node(state: RAGState) -> RAGState:
+def increment_retrieval_attempt_node(
+    state: RAGState,
+) -> RAGState:
 
-    attempt = state.get("retrieval_attempt", 0) + 1
+    attempt = (
+        state.get(
+            "retrieval_attempt",
+            0,
+        )
+        + 1
+    )
 
     print(f"====== RETRIEVAL ATTEMPT {attempt} ======")
 
     return {"retrieval_attempt": attempt}
 
 
-def hybrid_vector_done_node(state: RAGState) -> RAGState:
+# ============================================================================
+# HYBRID COMPLETION NODES
+# ============================================================================
+
+
+def hybrid_vector_done_node(
+    state: RAGState,
+) -> RAGState:
+
     print("========= HYBRID VECTOR BRANCH COMPLETE =========")
+
     return {}
 
 
-def hybrid_sql_done_node(state: RAGState) -> RAGState:
+def hybrid_sql_done_node(
+    state: RAGState,
+) -> RAGState:
+
     print("========= HYBRID SQL BRANCH COMPLETE =========")
+
     return {}
 
 
@@ -1815,7 +2261,15 @@ def build_rag_graph():
     # Nodes
     # ------------------------------------------------------------------------
 
+    # Memory / personalization
+
+    workflow.add_node(
+        "memory",
+        memory_node,
+    )
+
     # Primary routing
+
     workflow.add_node(
         "router",
         router_node,
@@ -1920,7 +2374,10 @@ def build_rag_graph():
     # Entry Point
     # ------------------------------------------------------------------------
 
-    workflow.set_entry_point("router")
+    workflow.set_entry_point("memory")
+
+    # Memory always runs before routing.
+    workflow.add_edge("memory", "router")
 
     # ------------------------------------------------------------------------
     # PRIMARY ROUTER
@@ -1950,9 +2407,6 @@ def build_rag_graph():
     # VECTOR
     # FTS
     # VECTOR_FTS
-    #
-    # VECTOR_FTS temporarily points to vector_search
-    # until RRF hybrid is implemented
     # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
@@ -2037,6 +2491,7 @@ def build_rag_graph():
     #
     # VECTOR  -> vector_search
     # FTS     -> fts_search
+    # VECTOR_FTS -> vector_fts_search
     #
     # ------------------------------------------------------------------------
 
@@ -2107,6 +2562,7 @@ def build_rag_graph():
             "END": END,
         },
     )
+
     # ------------------------------------------------------------------------
     # CHECKPOINT
     # ------------------------------------------------------------------------
@@ -2129,6 +2585,7 @@ def build_rag_graph():
             "credit_card_spend_summarization_agent.png",
             "wb",
         ) as f:
+
             f.write(graph_image)
 
         print(
@@ -2146,6 +2603,7 @@ def build_rag_graph():
 # CREATE GRAPH
 # ============================================================================
 
+
 rag_graph = build_rag_graph()
 
 
@@ -2157,17 +2615,22 @@ rag_graph = build_rag_graph()
 def run_search_agent(
     query: str,
     thread_id: str,
+    user_id: str,
 ):
+
     print("============ INSIDE run_search_agent ============")
 
     clear_query_cancellation(thread_id)
 
     initial_state = {
         "thread_id": thread_id,
+        "user_id": user_id,
         "query": query,
         "messages": [HumanMessage(content=query)],
         "route": "",
         "retrieval_query": "",
+        "fts_query": "",
+        "knowledge_strategy": "VECTOR",
         "retrieval_attempt": 0,
         "retrieved_docs": [],
         "reranked_docs": [],
@@ -2180,6 +2643,7 @@ def run_search_agent(
         "evaluation": "",
         "evaluation_feedback": "",
         "evaluate_count": 0,
+        "UserPreference": "",
     }
 
     config = {
@@ -2189,14 +2653,22 @@ def run_search_agent(
     }
 
     try:
+
         final_state = rag_graph.invoke(
             initial_state,
             config=config,
         )
 
-        return final_state["response"]
+        # ====================================================================
+        # FINAL RESPONSE GUARDRAIL
+        # ====================================================================
+
+        response = final_state["response"]
+
+        return response
 
     finally:
+
         clear_query_cancellation(thread_id)
 
 
@@ -2208,6 +2680,7 @@ def run_search_agent(
 async def run_search_agent_stream(
     query: str,
     thread_id: str,
+    user_id: str,
 ):
     """
     Execute the RAG graph while exposing:
@@ -2217,6 +2690,8 @@ async def run_search_agent_stream(
     - final structured response
     - cancellation events
     - errors
+
+    Memory lookup runs first for the authenticated user.
 
     DIRECT queries terminate at the router node.
     Retrieval queries continue through the normal RAG flow.
@@ -2228,10 +2703,13 @@ async def run_search_agent_stream(
 
     initial_state = {
         "thread_id": thread_id,
+        "user_id": user_id,
         "query": query,
         "messages": [HumanMessage(content=query)],
         "route": "",
         "retrieval_query": "",
+        "fts_query": "",
+        "knowledge_strategy": "VECTOR",
         "retrieval_attempt": 0,
         "retrieved_docs": [],
         "reranked_docs": [],
@@ -2244,6 +2722,7 @@ async def run_search_agent_stream(
         "evaluation": "",
         "evaluation_feedback": "",
         "evaluate_count": 0,
+        "UserPreference": "",
     }
 
     config = {
@@ -2254,6 +2733,7 @@ async def run_search_agent_stream(
     }
 
     final_response = None
+
     selected_route = None
 
     try:
@@ -2261,7 +2741,10 @@ async def run_search_agent_stream(
         async for chunk in rag_graph.astream(
             initial_state,
             config=config,
-            stream_mode=["custom", "updates"],
+            stream_mode=[
+                "custom",
+                "updates",
+            ],
             version="v2",
         ):
 
@@ -2312,16 +2795,28 @@ async def run_search_agent_stream(
             # ================================================================
 
             if chunk["type"] != "updates":
+
                 continue
 
             updates = chunk["data"]
 
-            if not isinstance(updates, dict):
+            if not isinstance(
+                updates,
+                dict,
+            ):
+
                 continue
 
-            for node_name, node_update in updates.items():
+            for (
+                node_name,
+                node_update,
+            ) in updates.items():
 
-                if not isinstance(node_update, dict):
+                if not isinstance(
+                    node_update,
+                    dict,
+                ):
+
                     continue
 
                 # ============================================================

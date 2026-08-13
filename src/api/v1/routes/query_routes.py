@@ -28,6 +28,7 @@ def query_endpoint(
         return query_documents(
             query=request.query,
             thread_id=request.thread_id,
+            user_id=request.user_id,
         )
 
     except GuardrailViolation as violation:
@@ -77,6 +78,7 @@ async def stream_query_endpoint(
         event_stream = query_documents_stream(
             query=request.query,
             thread_id=request.thread_id,
+            user_id=request.user_id,
         )
 
     except GuardrailViolation as violation:

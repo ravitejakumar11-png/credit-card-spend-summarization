@@ -8,6 +8,7 @@ from src.core.guardrails import guard_input, guard_output
 def query_documents(
     query: str,
     thread_id: str,
+    user_id: str | None = None,
 ):
     # Input guardrail
     guard_input(query)
@@ -18,6 +19,7 @@ def query_documents(
     result = run_search_agent(
         query=query,
         thread_id=thread_id,
+        user_id=user_id,
     )
 
     # run_search_agent() returns final_state["response"].
@@ -31,6 +33,7 @@ def query_documents(
 def query_documents_stream(
     query: str,
     thread_id: str | None = None,
+    user_id: str | None = None,
 ):
     # Input guardrail runs before the StreamingResponse is opened.
     # Output guardrail is intentionally NOT applied to the stream.
@@ -43,6 +46,7 @@ def query_documents_stream(
         async for event in run_search_agent_stream(
             query=query,
             thread_id=thread_id,
+            user_id=user_id,
         ):
             yield event
 
