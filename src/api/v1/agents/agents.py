@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -81,6 +82,34 @@ def _emit_progress(message: str) -> None:
         # rather than stream(), progress events should never break
         # the actual RAG pipeline.
         pass
+
+
+def _emit_stream_event(event: dict) -> None:
+    """
+    Emit a user-facing streaming event through LangGraph's custom stream.
+
+    This is intentionally best-effort so the normal non-streaming graph
+    execution is completely unaffected.
+    """
+    try:
+        writer = get_stream_writer()
+        writer(event)
+    except Exception:
+        pass
+
+
+def _emit_token(content: str) -> None:
+    if content:
+        _emit_stream_event(
+            {
+                "event": "token",
+                "content": content,
+            }
+        )
+
+
+def _emit_stream_reset() -> None:
+    _emit_stream_event({"event": "reset"})
 
 
 def _get_router_llm():
@@ -1382,15 +1411,7 @@ Page   : {page_no}
     }
 
 
-# ============================================================================
-# GENERATE ANSWER
-# ============================================================================
-
-
-def generate_answer_node(
-    state: RAGState,
-) -> RAGState:
-
+def generate_answer_node(state: RAGState, config=None) -> RAGState:
     _check_cancelled(state)
 
     print("========= INSIDE GENERATE ANSWER NODE =========")
@@ -1556,6 +1577,182 @@ Previous Evaluation Feedback (if any):
         ]
     )
 
+    # ------------------------------------------------------------------------
+    # STREAMING ANSWER PATH
+    #
+    # The normal path below remains unchanged and uses structured output.
+    # For the streaming endpoint, the answer itself must come from the
+    # underlying ChatOpenAI stream.  A structured-output wrapper is useful for
+    # correctness/metadata, but it does not expose the answer text as token
+    # events through our current graph stream.
+    #
+    # We therefore:
+    #   1. stream the natural-language answer from the base LLM internally;
+    #   2. collect the complete generated answer without exposing it to the UI;
+    #   3. run the existing structured-output call to populate metadata;
+    #   4. overwrite the structured response's answer with the exact generated
+    #      text so evaluation sees exactly what was generated;
+    #   5. only after the graph reaches its final evaluated state does the
+    #      streaming entry point expose the approved answer to the UI.
+    #
+    # The metadata call is intentionally kept because document/page/citation
+    # and SQL fields are part of the existing functionality.
+    # ------------------------------------------------------------------------
+
+    is_streaming = bool(
+        config and config.get("configurable", {}).get("streaming", False)
+    )
+
+    history = state.get("messages", [])
+
+    if is_streaming:
+        _check_cancelled(state)
+        _emit_progress("Preparing your answer...")
+
+        # Use the same source-accuracy instructions as the existing prompt,
+        # but explicitly request answer text only for the live stream.
+        stream_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """
+You are the NorthStar Credit Card Assistant.
+
+Answer the user's question using ONLY the supplied context.
+
+Preserve the exact meaning and scope of the source. Do not invent,
+generalize, infer, or expand policy statements. Preserve exceptions,
+qualifiers, transaction scopes, dates, amounts, and other constraints.
+
+Use conversation history to resolve references such as "this customer",
+"this card", "the previous one", or similar follow-ups.
+
+Be concise and business-friendly. Use bullets when useful. Explain
+numerical results clearly.
+
+Do not mention SQL, databases, vector search, retrieval, prompts,
+internal systems, or internal reasoning.
+
+If the supplied context is insufficient, clearly say that the available
+information is insufficient.
+
+IMPORTANT:
+Return ONLY the natural-language answer to the user's question.
+Do not return JSON. Do not return field names such as answer,
+document_name, page_no, policy_citations, or sql_query_executed.
+""",
+                ),
+                (
+                    "human",
+                    """
+Conversation History:
+
+{history}
+
+Current User Question:
+
+{query}
+
+Retrieved Context:
+
+{context}
+
+Previous Evaluation Feedback (if any):
+
+{feedback}
+""",
+                ),
+            ]
+        )
+
+        stream_chain = stream_prompt | llm
+
+        streamed_answer_parts = []
+
+        for chunk in stream_chain.stream(
+            {
+                "query": state["query"],
+                "context": state.get("final_context", ""),
+                "history": history,
+                "feedback": state.get(
+                    "evaluation_feedback",
+                    "",
+                ),
+            }
+        ):
+            _check_cancelled(state)
+
+            content = getattr(chunk, "content", "")
+
+            # ChatOpenAI normally returns a string here. Be defensive about
+            # providers/chunk formats that may return a list of content blocks.
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    item.get("text", "") for item in content if isinstance(item, dict)
+                )
+            else:
+                text = str(content) if content else ""
+
+            if text:
+                # Buffer the generated answer internally.
+                # Do NOT expose these chunks to the UI yet because this
+                # answer still has to pass through evaluate_answer_node().
+                streamed_answer_parts.append(text)
+
+        streamed_answer = "".join(streamed_answer_parts).strip()
+
+        _check_cancelled(state)
+
+        # Populate the existing structured response fields without allowing
+        # the second call to replace the exact text already streamed to UI.
+        metadata_prompt = ChatPromptTemplate.from_messages(
+            [
+                *prompt.messages,
+                (
+                    "human",
+                    """
+The generated answer is:
+
+{streamed_answer}
+
+Use this exact text as the `answer` field. Do not rewrite it.
+Populate the remaining response fields from the supplied context.
+""",
+                ),
+            ]
+        )
+
+        metadata_chain = metadata_prompt | structured_llm
+
+        metadata_result = metadata_chain.invoke(
+            {
+                "query": state["query"],
+                "context": state.get("final_context", ""),
+                "history": history,
+                "feedback": state.get(
+                    "evaluation_feedback",
+                    "",
+                ),
+                "streamed_answer": streamed_answer,
+            }
+        )
+
+        _check_cancelled(state)
+
+        response = metadata_result.model_dump()
+        response["answer"] = streamed_answer
+
+        if state.get("generated_sql"):
+            response["sql_query_executed"] = state["generated_sql"]
+
+        print("[generate_answer_node] Streaming answer generated.")
+
+        return {
+            "response": response,
+        }
+
     chain = prompt | structured_llm
 
     history = state.get("messages", [])
@@ -1610,16 +1807,9 @@ def evaluate_answer_node(
     _check_cancelled(state)
 
     print("========= INSIDE EVALUATE ANSWER NODE =========")
+    # if state.get("evaluate_count", 0) == 0:
 
-    if (
-        state.get(
-            "evaluate_count",
-            0,
-        )
-        == 0
-    ):
-
-        _emit_progress("Preparing your answer...")
+    #     _emit_progress("Preparing your answer...")
 
     print("========= ANSWER BEING EVALUATED =========")
 
@@ -1884,9 +2074,7 @@ def should_reformulate_after_search(
 
         # RRF scores are lower magnitude than vector similarity.
         # Tune threshold based on observed reciprocal rank values.
-
         score_key = "rrf_score"
-
         threshold = 0.01
 
     else:
@@ -2498,7 +2686,8 @@ async def run_search_agent_stream(
     Execute the RAG graph while exposing:
 
     - intermediate progress events from _emit_progress()
-    - final response from the appropriate graph node
+    - approved final answer as token-like UI chunks
+    - final structured response
     - cancellation events
     - errors
 
@@ -2539,6 +2728,7 @@ async def run_search_agent_stream(
     config = {
         "configurable": {
             "thread_id": thread_id,
+            "streaming": True,
         }
     }
 
@@ -2568,20 +2758,34 @@ async def run_search_agent_stream(
 
                 data = chunk["data"]
 
-                if isinstance(data, dict) and data.get("event") == "progress":
+                if isinstance(data, dict):
+                    event_type = data.get("event")
 
-                    message = data.get(
-                        "message",
-                        "",
-                    )
+                    if event_type == "progress":
+                        message = data.get(
+                            "message",
+                            "",
+                        )
 
-                    if message:
+                        if message:
+                            print("[run_search_agent_stream] " f"Progress: {message}")
+                            yield {
+                                "event": "progress",
+                                "message": message,
+                            }
 
-                        print("[run_search_agent_stream] " f"Progress: {message}")
+                    elif event_type == "token":
+                        content = data.get("content", "")
 
+                        if content:
+                            yield {
+                                "event": "token",
+                                "content": content,
+                            }
+
+                    elif event_type == "reset":
                         yield {
-                            "event": "progress",
-                            "message": message,
+                            "event": "reset",
                         }
 
                 continue
@@ -2634,6 +2838,20 @@ async def run_search_agent_stream(
                         if response:
 
                             final_response = response
+
+                            direct_answer = response.get("answer", "")
+
+                            if direct_answer:
+                                # DIRECT answers terminate at the router and do
+                                # not pass through evaluation. They are therefore
+                                # safe to stream immediately.
+                                for start in range(0, len(direct_answer), 12):
+                                    raise_if_query_cancelled(thread_id)
+                                    yield {
+                                        "event": "token",
+                                        "content": direct_answer[start : start + 12],
+                                    }
+                                    await asyncio.sleep(0.02)
 
                             print(
                                 "[run_search_agent_stream] " "DIRECT response captured."
@@ -2688,6 +2906,36 @@ async def run_search_agent_stream(
             )
 
         print("[run_search_agent_stream] " f"Final route: {selected_route}")
+
+        # --------------------------------------------------------------------
+        # APPROVED ANSWER STREAM
+        # --------------------------------------------------------------------
+        #
+        # For RDBMS / VECTOR / HYBRID queries, generate_answer_node() buffers
+        # the answer and evaluate_answer_node() decides whether it is accepted
+        # or needs regeneration. Therefore, nothing from the generated answer
+        # is sent to the UI until the graph has reached its final state.
+        #
+        # At this point final_response is the authoritative response: either
+        # evaluation passed or the second evaluation attempt was reached.
+        # Stream that approved answer to the existing UI in small chunks.
+        # The short delay is intentional: without it all chunks can arrive in
+        # the same event-loop turn, causing the Streamlit queue to receive the
+        # whole answer before its 200ms fragment gets a chance to render it.
+        # --------------------------------------------------------------------
+
+        approved_answer = final_response.get("answer", "")
+
+        if selected_route != "DIRECT" and approved_answer:
+            for start in range(0, len(approved_answer), 12):
+                raise_if_query_cancelled(thread_id)
+
+                yield {
+                    "event": "token",
+                    "content": approved_answer[start : start + 12],
+                }
+
+                await asyncio.sleep(0.02)
 
         yield {
             "event": "final",

@@ -1,21 +1,13 @@
-# Virtual environment
-.venv/
-venv/
-
-# Environment variables
-.env
-
-# Python
+# Python-generated files
 __pycache__/
-*.pyc
-*.pyo
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
 
-# IDE
-.vscode/
+# Virtual environments
+.venv
 
-# Testing
-.pytest_cache/
-
-# OS
-.DS_Store
-Thumbs.db
+.env 
+dotenv
