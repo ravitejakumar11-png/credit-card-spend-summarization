@@ -17,6 +17,17 @@ _QUERY_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 
 # ============================================================================
+# Session helpers
+# ============================================================================
+
+
+def _start_new_thread() -> None:
+    """Start a clean conversation thread."""
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.chat_history = []
+
+
+# ============================================================================
 # Page configuration
 # ============================================================================
 
@@ -35,6 +46,9 @@ st.title("NorthStar Credit Card Assistant")
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
 
 
 # ============================================================================
@@ -111,6 +125,7 @@ if "ingest_result" not in st.session_state:
 def _execute_query_request(
     query: str,
     thread_id: str,
+    user_id: str,
     progress_queue: queue.Queue,
 ) -> dict:
     """Run the FastAPI streaming request in a background thread.
@@ -123,6 +138,7 @@ def _execute_query_request(
     print("========== BACKGROUND QUERY WORKER ==========")
     print(f"Query     : {query!r}")
     print(f"Thread ID : {thread_id!r}")
+    print(f"User ID   : {user_id!r}")
 
     try:
         with requests.post(
@@ -130,6 +146,7 @@ def _execute_query_request(
             json={
                 "query": query,
                 "thread_id": thread_id,
+                "user_id": user_id,
             },
             stream=True,
             timeout=300,
@@ -255,6 +272,65 @@ def _execute_query_request(
 
 with st.sidebar:
 
+    # ========================================================================
+    # User Login
+    # ========================================================================
+
+    st.header("User Login")
+
+    if st.session_state.user_id:
+        st.success(f"Logged in as: {st.session_state.user_id}")
+
+        if st.button(
+            "Logout",
+            use_container_width=True,
+            disabled=st.session_state.query_running,
+        ):
+            st.session_state.user_id = ""
+            _start_new_thread()
+            st.rerun()
+
+    else:
+        login_user_id = st.text_input(
+            "User ID",
+            placeholder="e.g. C-1001",
+            help=(
+                "Enter a user ID to enable persistent Mem0 preferences. "
+                "No username/password validation is performed."
+            ),
+        )
+
+        login_col, guest_col = st.columns(2)
+
+        with login_col:
+            if st.button(
+                "Login",
+                use_container_width=True,
+                disabled=st.session_state.query_running,
+            ):
+                login_user_id = login_user_id.strip()
+
+                if login_user_id:
+                    st.session_state.user_id = login_user_id
+                    _start_new_thread()
+                    st.rerun()
+                else:
+                    st.warning("Please enter a User ID.")
+
+        with guest_col:
+            if st.button(
+                "Continue as Guest",
+                use_container_width=True,
+                disabled=st.session_state.query_running,
+            ):
+                st.session_state.user_id = ""
+                _start_new_thread()
+                st.rerun()
+
+    st.caption(
+        "Guest requests use an empty user_id. " "Login accepts any non-empty User ID."
+    )
+
     st.header("Developer Mode")
 
     developer_mode = st.toggle(
@@ -272,8 +348,7 @@ with st.sidebar:
         "Clear Chat",
         use_container_width=True,
     ):
-        st.session_state.chat_history = []
-        st.session_state.thread_id = str(uuid.uuid4())
+        _start_new_thread()
         st.rerun()
 
     if developer_mode:
@@ -906,6 +981,7 @@ if query and not st.session_state.query_running:
     print(f"Query     : {query!r}")
 
     print(f"Thread ID : " f"{st.session_state.thread_id!r}")
+    print(f"User ID   : " f"{st.session_state.user_id!r}")
 
     # ------------------------------------------------------------------------
     # Persist user message immediately.
@@ -944,6 +1020,7 @@ if query and not st.session_state.query_running:
         _execute_query_request,
         query,
         st.session_state.thread_id,
+        st.session_state.user_id,
         st.session_state.query_progress_queue,
     )
     # ------------------------------------------------------------------------
