@@ -17,6 +17,17 @@ _QUERY_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 
 # ============================================================================
+# Session helpers
+# ============================================================================
+
+
+def _start_new_thread() -> None:
+    """Start a clean conversation thread."""
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.chat_history = []
+
+
+# ============================================================================
 # Page configuration
 # ============================================================================
 
@@ -35,6 +46,9 @@ st.title("NorthStar Credit Card Assistant")
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
 
 
 # ============================================================================
@@ -72,6 +86,8 @@ if "query_progress_queue" not in st.session_state:
 
 if "streaming_answer" not in st.session_state:
     st.session_state.streaming_answer = ""
+
+
 # ============================================================================
 # Delete / Clear / Ingestion state
 # ============================================================================
@@ -111,18 +127,20 @@ if "ingest_result" not in st.session_state:
 def _execute_query_request(
     query: str,
     thread_id: str,
+    user_id: str,
     progress_queue: queue.Queue,
 ) -> dict:
     """Run the FastAPI streaming request in a background thread.
 
-    The backend sends SSE events for progress, answer tokens, final response,
-    cancellation, and errors. Events are forwarded to the Streamlit fragment
-    through a thread-safe queue.
+    The backend sends SSE events for progress, answer tokens, reset events,
+    final response, cancellation, and errors. Events are forwarded to the
+    Streamlit fragment through a thread-safe queue.
     """
 
     print("========== BACKGROUND QUERY WORKER ==========")
     print(f"Query     : {query!r}")
     print(f"Thread ID : {thread_id!r}")
+    print(f"User ID   : {user_id!r}")
 
     try:
         with requests.post(
@@ -130,6 +148,7 @@ def _execute_query_request(
             json={
                 "query": query,
                 "thread_id": thread_id,
+                "user_id": user_id,
             },
             stream=True,
             timeout=300,
@@ -199,6 +218,17 @@ def _execute_query_request(
                         )
                     continue
 
+                if event_type == "reset":
+                    # The evaluator may reject an answer and request
+                    # regeneration. Forward reset so the UI does not
+                    # concatenate the rejected answer with the replacement.
+                    progress_queue.put(
+                        {
+                            "event": "reset",
+                        }
+                    )
+                    continue
+
                 if event_type == "final":
                     return {
                         "status": "success",
@@ -255,6 +285,65 @@ def _execute_query_request(
 
 with st.sidebar:
 
+    # ========================================================================
+    # User Login
+    # ========================================================================
+
+    st.header("User Login")
+
+    if st.session_state.user_id:
+        st.success(f"Logged in as: {st.session_state.user_id}")
+
+        if st.button(
+            "Logout",
+            use_container_width=True,
+            disabled=st.session_state.query_running,
+        ):
+            st.session_state.user_id = ""
+            _start_new_thread()
+            st.rerun()
+
+    else:
+        login_user_id = st.text_input(
+            "User ID",
+            placeholder="e.g. C-1001",
+            help=(
+                "Enter a user ID to enable persistent Mem0 preferences. "
+                "No username/password validation is performed."
+            ),
+        )
+
+        login_col, guest_col = st.columns(2)
+
+        with login_col:
+            if st.button(
+                "Login",
+                use_container_width=True,
+                disabled=st.session_state.query_running,
+            ):
+                login_user_id = login_user_id.strip()
+
+                if login_user_id:
+                    st.session_state.user_id = login_user_id
+                    _start_new_thread()
+                    st.rerun()
+                else:
+                    st.warning("Please enter a User ID.")
+
+        with guest_col:
+            if st.button(
+                "Continue as Guest",
+                use_container_width=True,
+                disabled=st.session_state.query_running,
+            ):
+                st.session_state.user_id = ""
+                _start_new_thread()
+                st.rerun()
+
+    st.caption(
+        "Guest requests use an empty user_id. " "Login accepts any non-empty User ID."
+    )
+
     st.header("Developer Mode")
 
     developer_mode = st.toggle(
@@ -272,8 +361,7 @@ with st.sidebar:
         "Clear Chat",
         use_container_width=True,
     ):
-        st.session_state.chat_history = []
-        st.session_state.thread_id = str(uuid.uuid4())
+        _start_new_thread()
         st.rerun()
 
     if developer_mode:
@@ -291,7 +379,6 @@ with st.sidebar:
             st.success(st.session_state.ingest_message)
 
             if st.session_state.ingest_result:
-
                 st.json(st.session_state.ingest_result)
 
             st.session_state.ingest_message = None
@@ -309,7 +396,6 @@ with st.sidebar:
         ):
 
             try:
-
                 with st.spinner("Uploading and ingesting document..."):
 
                     response = requests.post(
@@ -329,13 +415,11 @@ with st.sidebar:
                     result = response.json()
 
                     st.session_state.ingest_message = "Document ingested successfully."
-
                     st.session_state.ingest_result = result
 
                     st.rerun()
 
                 else:
-
                     st.error(
                         f"Ingestion failed: "
                         f"{response.status_code} - "
@@ -343,7 +427,6 @@ with st.sidebar:
                     )
 
             except requests.RequestException as exc:
-
                 st.error(f"Could not connect to the FastAPI server: {exc}")
 
         st.divider()
@@ -355,15 +438,11 @@ with st.sidebar:
         st.subheader("Knowledge Base")
 
         if st.session_state.delete_message:
-
             st.success(st.session_state.delete_message)
-
             st.session_state.delete_message = None
 
         if st.session_state.clear_message:
-
             st.success(st.session_state.clear_message)
-
             st.session_state.clear_message = None
 
         # --------------------------------------------------------------------
@@ -373,7 +452,6 @@ with st.sidebar:
         documents = []
 
         try:
-
             with st.spinner("Loading documents..."):
 
                 response = requests.get(
@@ -391,7 +469,6 @@ with st.sidebar:
                 )
 
             else:
-
                 st.error(
                     f"Failed to load documents: "
                     f"{response.status_code} - "
@@ -399,7 +476,6 @@ with st.sidebar:
                 )
 
         except requests.RequestException as exc:
-
             st.error(f"Could not connect to the FastAPI server: {exc}")
 
         # --------------------------------------------------------------------
@@ -420,7 +496,6 @@ with st.sidebar:
             )
 
             selected_document = document_options[selected_filename]
-
             selected_doc_id = str(selected_document["id"])
 
             st.caption(f"Document ID: {selected_doc_id}")
@@ -435,11 +510,8 @@ with st.sidebar:
                     "Delete Selected Document",
                     use_container_width=True,
                 ):
-
                     st.session_state.confirm_delete_doc_id = selected_doc_id
-
                     st.session_state.confirm_delete_filename = selected_filename
-
                     st.rerun()
 
             if confirmation_active:
@@ -461,11 +533,9 @@ with st.sidebar:
                     ):
 
                         doc_id_to_delete = st.session_state.confirm_delete_doc_id
-
                         filename_to_delete = st.session_state.confirm_delete_filename
 
                         try:
-
                             with st.spinner("Deleting document..."):
 
                                 response = requests.delete(
@@ -487,7 +557,6 @@ with st.sidebar:
                                 st.rerun()
 
                             else:
-
                                 st.error(
                                     f"Failed to delete document: "
                                     f"{response.status_code} - "
@@ -495,7 +564,6 @@ with st.sidebar:
                                 )
 
                         except requests.RequestException as exc:
-
                             st.error(
                                 "Could not connect to the " f"FastAPI server: {exc}"
                             )
@@ -506,14 +574,11 @@ with st.sidebar:
                         "Cancel",
                         use_container_width=True,
                     ):
-
                         st.session_state.confirm_delete_doc_id = None
                         st.session_state.confirm_delete_filename = None
-
                         st.rerun()
 
         else:
-
             st.info("No documents are currently ingested.")
 
         st.divider()
@@ -535,9 +600,7 @@ with st.sidebar:
                 "Clear All Ingested Data",
                 use_container_width=True,
             ):
-
                 st.session_state.confirm_clear_all = True
-
                 st.rerun()
 
         if st.session_state.confirm_clear_all:
@@ -558,7 +621,6 @@ with st.sidebar:
                 ):
 
                     try:
-
                         with st.spinner("Clearing ingested data..."):
 
                             response = requests.delete(
@@ -569,7 +631,6 @@ with st.sidebar:
                         if response.ok:
 
                             st.session_state.confirm_clear_all = False
-
                             st.session_state.confirm_delete_doc_id = None
                             st.session_state.confirm_delete_filename = None
 
@@ -603,9 +664,7 @@ with st.sidebar:
                     "Cancel",
                     use_container_width=True,
                 ):
-
                     st.session_state.confirm_clear_all = False
-
                     st.rerun()
 
 
@@ -620,7 +679,6 @@ with st.sidebar:
 for message in st.session_state.chat_history:
 
     with st.chat_message(message["role"]):
-
         st.markdown(message["content"])
 
 
@@ -630,7 +688,7 @@ for message in st.session_state.chat_history:
 # IMPORTANT:
 # This fragment NEVER permanently renders the final answer.
 #
-# Its only responsibilities are:
+# Its responsibilities are:
 #
 #   1. Show that processing is happening.
 #   2. Show the Stop button.
@@ -649,7 +707,7 @@ def active_query_fragment():
         return
 
     # ------------------------------------------------------------------------
-    # Read progress/token events from the background query worker.
+    # Read progress/token/reset events from the background query worker.
     # ------------------------------------------------------------------------
 
     progress_queue = st.session_state.query_progress_queue
@@ -701,22 +759,19 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
     # Query is still running
     #
-    # IMPORTANT:
-    # Check future.done() BEFORE rendering the progress message.
-    #
-    # This prevents a stale "Preparing your answer..." message from being
-    # rendered during the final fragment execution after the backend has
-    # already completed.
+    # Check future.done() BEFORE rendering the progress message. This
+    # prevents a stale processing message from being rendered after the
+    # backend has already completed.
     # ------------------------------------------------------------------------
 
     if not future.done():
 
-        # ------------------------------------------------------------------------
+        # --------------------------------------------------------------------
         # Processing indicator
         #
-        # Once answer tokens have started arriving, hide the progress message.
-        # The streamed answer becomes the primary UI at that point.
-        # ------------------------------------------------------------------------
+        # Once answer tokens have started arriving, hide the progress
+        # message. The streamed answer becomes the primary UI.
+        # --------------------------------------------------------------------
 
         if not st.session_state.streaming_answer:
 
@@ -741,16 +796,20 @@ def active_query_fragment():
         # --------------------------------------------------------------------
 
         if st.session_state.query_cancel_requested:
+
             st.button(
                 "⏹ Stopping...",
                 disabled=True,
                 use_container_width=True,
             )
+
         else:
+
             if st.button(
                 "⏹ Stop",
                 use_container_width=True,
             ):
+
                 print("========== QUERY CANCELLATION REQUEST ==========")
                 print(f"Thread ID : {st.session_state.thread_id!r}")
 
@@ -780,18 +839,12 @@ def active_query_fragment():
         return
 
     # ------------------------------------------------------------------------
-    # Query is still running
-    # ------------------------------------------------------------------------
-
-    if not future.done():
-        return
-
-    # ------------------------------------------------------------------------
     # Query has completed
     # ------------------------------------------------------------------------
 
     try:
         result = future.result()
+
     except Exception as exc:
         print(f"[ui] Background query failed: {exc}")
         result = {
@@ -803,12 +856,13 @@ def active_query_fragment():
         }
 
     # ------------------------------------------------------------------------
-    # Drain any token/reset events that arrived immediately before completion.
+    # Drain token/reset events that arrived immediately before completion.
     # This closes the small race between the worker receiving the final SSE
     # event and this fragment observing future.done().
     # ------------------------------------------------------------------------
 
     if progress_queue is not None:
+
         while True:
             try:
                 event = progress_queue.get_nowait()
@@ -850,6 +904,7 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
 
     if was_cancel_requested or result.get("status") == "cancelled":
+
         st.session_state.streaming_answer = ""
 
         st.session_state.chat_history.append(
@@ -869,12 +924,15 @@ def active_query_fragment():
     # ------------------------------------------------------------------------
 
     if result.get("status") == "success":
+
         final_response = result.get("response")
 
         if final_response:
+
             answer = final_response.get("answer", "")
 
             if answer:
+
                 # The final structured response is authoritative.
                 # Persist it before rerunning so it appears in chat history.
                 st.session_state.chat_history.append(
@@ -883,7 +941,9 @@ def active_query_fragment():
                         "content": answer,
                     }
                 )
+
             else:
+
                 st.session_state.chat_history.append(
                     {
                         "role": "assistant",
@@ -893,7 +953,9 @@ def active_query_fragment():
                         ),
                     }
                 )
+
         else:
+
             st.session_state.chat_history.append(
                 {
                     "role": "assistant",
@@ -956,10 +1018,9 @@ query = st.chat_input(
 if query and not st.session_state.query_running:
 
     print("========== STREAMLIT QUERY ==========")
-
     print(f"Query     : {query!r}")
-
-    print(f"Thread ID : " f"{st.session_state.thread_id!r}")
+    print(f"Thread ID : {st.session_state.thread_id!r}")
+    print(f"User ID   : {st.session_state.user_id!r}")
 
     # ------------------------------------------------------------------------
     # Persist user message immediately.
@@ -977,15 +1038,10 @@ if query and not st.session_state.query_running:
     # ------------------------------------------------------------------------
 
     st.session_state.active_query = query
-
     st.session_state.query_running = True
-
     st.session_state.query_cancel_requested = False
-
     st.session_state.query_error = None
-
     st.session_state.query_progress = "Processing your question..."
-
     st.session_state.streaming_answer = ""
 
     # ------------------------------------------------------------------------
@@ -998,8 +1054,10 @@ if query and not st.session_state.query_running:
         _execute_query_request,
         query,
         st.session_state.thread_id,
+        st.session_state.user_id,
         st.session_state.query_progress_queue,
     )
+
     # ------------------------------------------------------------------------
     # Rerun immediately.
     #
