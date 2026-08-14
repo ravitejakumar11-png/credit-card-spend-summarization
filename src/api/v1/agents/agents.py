@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 
 import cohere
@@ -31,13 +33,9 @@ from mem0 import MemoryClient
 load_dotenv()
 
 
-# ============================================================================
-# CANCELLATION
-# ============================================================================
-
-
 def _check_cancelled(state: RAGState) -> None:
     thread_id = state.get("thread_id")
+
     raise_if_query_cancelled(thread_id)
 
 
@@ -48,7 +46,7 @@ def _check_cancelled(state: RAGState) -> None:
 
 def _emit_progress(message: str) -> None:
     """
-    Emit a small user-facing progress update.
+    Emit a small, user-facing progress update.
 
     IMPORTANT:
         This intentionally exposes only high-level progress.
@@ -67,6 +65,7 @@ def _emit_progress(message: str) -> None:
     """
 
     try:
+
         writer = get_stream_writer()
 
         writer(
@@ -77,14 +76,40 @@ def _emit_progress(message: str) -> None:
         )
 
     except Exception:
-        # Streaming is optional.
-        # Never allow progress streaming to break the RAG pipeline.
+        # Streaming is an optional UI feature.
+        #
+        # If the graph is being executed using normal invoke()
+        # rather than stream(), progress events should never break
+        # the actual RAG pipeline.
         pass
 
 
-# ============================================================================
-# LLM FACTORIES
-# ============================================================================
+def _emit_stream_event(event: dict) -> None:
+    """
+    Emit a user-facing streaming event through LangGraph's custom stream.
+
+    This is intentionally best-effort so the normal non-streaming graph
+    execution is completely unaffected.
+    """
+    try:
+        writer = get_stream_writer()
+        writer(event)
+    except Exception:
+        pass
+
+
+def _emit_token(content: str) -> None:
+    if content:
+        _emit_stream_event(
+            {
+                "event": "token",
+                "content": content,
+            }
+        )
+
+
+def _emit_stream_reset() -> None:
+    _emit_stream_event({"event": "reset"})
 
 
 def _get_router_llm():
@@ -109,11 +134,6 @@ def _get_evaluator_llm():
         api_key=os.getenv("OPENAI_API_KEY"),
         temperature=0,
     )
-
-
-# ============================================================================
-# MEM0
-# ============================================================================
 
 
 client = MemoryClient(api_key=os.getenv("MEM0_API_KEY"))
@@ -151,26 +171,18 @@ class KnowledgeStrategyDecision(BaseModel):
 
 class RetrievalQueryDecision(BaseModel):
     retrieval_query: str
+
     fts_query: str
 
 
 class EvaluationDecision(BaseModel):
-    evaluation: Literal[
-        "PASS",
-        "REGENERATE",
-    ]
-
+    evaluation: Literal["PASS", "REGENERATE"]
     feedback: str
 
 
 class UserPreferenceDecision(BaseModel):
     is_preference: bool
     preference: str
-
-
-# ============================================================================
-# MEM0 SAVE
-# ============================================================================
 
 
 def save_user_preference_to_mem0(
@@ -597,13 +609,6 @@ def router_node(state: RAGState) -> RAGState:
     history = state.get("messages", [])
     query = state["query"]
 
-    user_preferences = state.get(
-        "user_preferences",
-        "",
-    )
-
-    print("[router_node] UserPreference context:\n" f"{user_preferences}")
-
     llm = _get_router_llm()
 
     structured_llm = llm.with_structured_output(RouteDecision)
@@ -651,14 +656,34 @@ such as:
 - statements
 - customer/card details
 
+A generic question about earning rates, benefits, eligibility, fees,
+rules, or policies is VECTOR_DB even if phrased using "I", "my", or "me".
+
+Examples:
+
+- "How many points do I earn for dining?" → VECTOR_DB
+- "How many points did I earn for dining last month?" → RDBMS
+- "What is the dining reward rate?" → VECTOR_DB
+
 3. HYBRID
 
 Use when BOTH the relational database and knowledge base are required.
+
+Examples include questions requiring customer-specific data together with:
+
+- Reward rules
+- Fee or interest policies
+- Billing rules
+- Spend categorization rules
+- Other product or policy information
 
 Use HYBRID only when the answer genuinely requires BOTH:
 
 1. actual customer/transaction data
 2. knowledge-base rules or policies
+
+Do not use HYBRID merely because the question mentions rewards,
+spending, fees, or another topic that exists in both sources.
 
 4. DIRECT
 
@@ -666,81 +691,21 @@ Use when no database or knowledge-base retrieval is required.
 
 This includes:
 
-- Greetings
-- Simple conversation
+- Greetings and simple conversation
 - Questions about the assistant's capabilities
 - General chit-chat
 - Questions unrelated to banking, credit cards, transactions or rewards
-- Questions about the user's previously stored preferences, likes,
-  dislikes, habits, choices or defaults
-
-IMPORTANT USER PREFERENCE RULE:
-
-The system provides a "User Preference Memory" section below.
-
-This memory contains preferences that were previously stored for
-the authenticated user.
-
-Examples:
-
-- User prefers travel by bus rather than train.
-- User likes the NorthStar Gold card.
-- User prefers concise answers.
-- User prefers cashback rewards.
-
-If the user asks about their own preferences, likes, dislikes,
-choices, habits or remembered preferences, use the supplied
-User Preference Memory to answer the question.
-
-Examples:
-
-User:
-"What do I prefer?"
-
-If memory contains:
-- User prefers travel by bus rather than train.
-- User likes the NorthStar Gold card.
-
-Then the DIRECT response should say something like:
-
-"You prefer traveling by bus rather than train, and you like the
-NorthStar Gold card."
-
-User:
-"What cards do I like?"
-
-If memory contains:
-- User likes the NorthStar Gold card.
-
-Then answer:
-
-"You like the NorthStar Gold card."
-
-User:
-"What are my preferences?"
-
-Use all relevant preferences from the supplied memory.
-
-If no relevant preference memory exists, say that no stored preference
-was found rather than pretending to remember something.
-
-IMPORTANT:
-
-- Never invent a preference.
-- Never infer a preference that is not present in User Preference Memory.
-- Never use another user's memory.
-- User Preference Memory is only personalization information.
-- It is NOT authoritative for balances, transactions, fees, rewards,
-  policies, eligibility, or other factual product/customer information.
+- Conversational follow-ups that require no new information from the
+  database or knowledge base.
 
 For DIRECT:
 
-- Provide a brief natural response in `direct_response`.
-- If the question is about user preferences, answer using ONLY the
-  supplied User Preference Memory.
-- Do not retrieve from RDBMS or VECTOR_DB.
-- For unrelated questions, politely explain that the assistant is
-  designed for NorthStar credit-card and related topics.
+- Provide a brief natural response in `direct_response` for greetings,
+  capabilities and simple conversation.
+- For unrelated questions, provide a brief polite refusal explaining
+  that the assistant is designed for NorthStar credit-card and related
+  topics.
+- Do not retrieve from the RDBMS or VECTOR_DB.
 
 Routing rules:
 
@@ -748,9 +713,10 @@ Routing rules:
 - Use HYBRID whenever both structured data and knowledge-base information
   are required.
 - Use retrieval routes only when retrieval is necessary.
-- Use conversation history to resolve references.
+- Use conversation history to resolve references and determine whether
+  the current question is related to the ongoing conversation.
+- If unsure between a single retrieval source and HYBRID, choose HYBRID.
 - For VECTOR_DB, RDBMS and HYBRID, set `direct_response` to an empty string.
-- For DIRECT, always provide the actual response in `direct_response`.
 
 Return:
 
@@ -769,19 +735,6 @@ Conversation History:
 Current User Question:
 
 {query}
-
-User Preference Memory:
-
-{user_preferences}
-
-IMPORTANT:
-
-If the current question is asking about the user's preferences,
-likes, dislikes, habits, choices or defaults, use the User Preference
-Memory above to formulate the DIRECT response.
-
-If the User Preference Memory is empty or does not contain a relevant
-preference, do not invent one. Say that no stored preference was found.
 """,
             ),
         ]
@@ -791,9 +744,8 @@ preference, do not invent one. Say that no stored preference was found.
 
     decision = chain.invoke(
         {
-            "query": query,
-            "history": history,
-            "user_preferences": user_preferences,
+            "query": state["query"],
+            "history": state.get("messages", []),
         }
     )
 
@@ -810,15 +762,12 @@ preference, do not invent one. Say that no stored preference was found.
     elif decision.route == "HYBRID":
 
         _emit_progress("Checking your account information...")
+
         _emit_progress("Checking the relevant card information...")
 
-    elif decision.route == "DIRECT":
-
-        _emit_progress("Preparing a response...")
-
     print(f"[router_node] Route : {decision.route}")
+
     print(f"[router_node] Reason: {decision.reason}")
-    print(f"[router_node] Direct Response: {decision.direct_response}")
 
     return {
         "route": decision.route,
@@ -838,18 +787,14 @@ preference, do not invent one. Say that no stored preference was found.
 # ============================================================================
 
 
-def hybrid_start_node(
-    state: RAGState,
-) -> RAGState:
+def hybrid_start_node(state: RAGState) -> RAGState:
 
     print("========= INSIDE HYBRID START NODE =========")
 
     return {}
 
 
-def hybrid_join_node(
-    state: RAGState,
-) -> RAGState:
+def hybrid_join_node(state: RAGState) -> RAGState:
 
     print("========= INSIDE HYBRID JOIN NODE =========")
 
@@ -861,9 +806,7 @@ def hybrid_join_node(
 # ============================================================================
 
 
-def knowledge_strategy_router_node(
-    state: RAGState,
-) -> RAGState:
+def knowledge_strategy_router_node(state: RAGState) -> RAGState:
 
     print("====== INSIDE KNOWLEDGE STRATEGY ROUTER ======")
 
@@ -880,8 +823,7 @@ def knowledge_strategy_router_node(
             (
                 "system",
                 """
-You are a retrieval strategy classifier for a banking
-knowledge base.
+You are a retrieval strategy classifier for a banking knowledge base.
 
 Your task is to decide the best document retrieval strategy.
 
@@ -891,83 +833,160 @@ Available strategies:
 
 Use VECTOR when:
 
-- The user is asking for explanation, reasoning, summary,
-  or conceptual understanding.
+- The user is asking for explanation, reasoning, summary, or conceptual understanding.
 - The answer requires semantic understanding.
 - The wording may not exactly match the document.
 
 Examples:
-
 "What are the benefits of this credit card?"
-
 "Explain reward redemption rules"
-
 "How does billing work?"
-
 
 2. FTS
 
 Use FTS when:
 
-- Exact words, phrases, identifiers, names, codes, or specific
-  terms matter.
+- Exact words, phrases, identifiers, names, codes, or specific terms matter.
 - The user is looking for an exact mention in documents.
 
 Examples:
-
 "Find the section mentioning NEFT"
-
 "Where is Statement Credit mentioned?"
-
 "Find Platinum card"
-
 
 3. VECTOR_FTS
 
 Use VECTOR_FTS when:
 
-- The query needs both semantic understanding and exact terminology.
+- The query needs both semantic understanding and exact terminology matching.
 - The question is complex or policy/rule based.
 - Missing either semantic or keyword retrieval may reduce recall.
 
 Examples:
-
 "What are the eligibility rules for accelerated dining rewards?"
-
 "Explain reward points conversion and redemption options"
-
 "What is MCC category and how does NorthStar classify transactions?"
-
 "Explain the dining reward eligibility rules for accelerated points"
-
 "What are the redemption options and their point conversion values?"
-
 "Tell me about Platinum card lounge benefits"
 
+After selecting the retrieval strategy, create the appropriate search queries.
 
-Create appropriate retrieval queries.
+The queries serve different purposes.
 
-For VECTOR:
+================================================
 
-Generate retrieval_query.
+retrieval_query:
 
-Set fts_query empty.
-
-For FTS:
-
-Generate fts_query.
-
-Set retrieval_query empty.
-
-For VECTOR_FTS:
-
-Generate both.
+Used for vector similarity search.
 
 Rules:
 
+- Write a standalone semantic search query.
+- Preserve the user's intent.
+- Add useful banking or credit-card terminology.
+- Expand concepts where helpful.
 - Do not answer the question.
-- Do not invent facts.
-- Return structured output only.
+
+Example:
+
+User:
+"What are reward redemption options?"
+
+retrieval_query:
+"NorthStar credit card reward points redemption options,
+conversion values, and redemption methods"
+
+================================================
+
+fts_query:
+
+Used for PostgreSQL full-text search.
+
+Rules:
+
+- Extract important lexical terms.
+- Preserve exact phrases, acronyms, product names,
+  codes, and identifiers.
+- Remove conversational words.
+- Do not create explanations.
+- Do not answer the question.
+
+Example:
+
+User:
+"What is MCC?"
+
+fts_query:
+"MCC Merchant Category Code"
+
+================================================
+
+For VECTOR strategy:
+
+Generate:
+
+- retrieval_query
+
+Set:
+
+- fts_query as empty string
+
+For FTS strategy:
+
+Generate:
+
+- fts_query
+
+Set:
+
+- retrieval_query as empty string
+
+For VECTOR_FTS strategy:
+
+Generate BOTH.
+
+Example:
+
+User:
+"Explain reward points conversion and redemption options"
+
+knowledge_strategy:
+VECTOR_FTS
+
+retrieval_query:
+"NorthStar credit card reward points conversion,
+redemption options, redemption values and methods"
+
+fts_query:
+"reward points conversion redemption options
+Statement Credit Partner Vouchers Airline Miles"
+
+Important:
+FTS performs lexical matching.
+Use FTS when the user likely expects exact terminology,
+names, phrases, identifiers, or direct references.
+
+Do not choose FTS only because the question contains
+common words like "credit", "card", "reward", or "payment".
+
+Rules:
+
+- Return ONLY JSON.
+- Do not add explanations.
+
+Output format:
+
+Return ONLY JSON.
+
+Output format:
+
+{{
+"knowledge_strategy": "VECTOR | FTS | VECTOR_FTS",
+"reason": "short explanation",
+"retrieval_query": "semantic search query for vector retrieval",
+"fts_query": "lexical search query for full text search"
+}}
 """,
             ),
             (
@@ -990,10 +1009,7 @@ Current User Question:
     decision = chain.invoke(
         {
             "query": state["query"],
-            "history": state.get(
-                "messages",
-                [],
-            ),
+            "history": state.get("messages", []),
         }
     )
 
@@ -1006,7 +1022,6 @@ Current User Question:
         "FTS",
         "VECTOR_FTS",
     ):
-
         strategy = "VECTOR_FTS"
 
     print(f"[knowledge_strategy_router_node] Route : {strategy}")
@@ -1027,9 +1042,7 @@ Current User Question:
 # ============================================================================
 
 
-def query_optimization_node(
-    state: RAGState,
-) -> RAGState:
+def query_optimization_node(state: RAGState) -> RAGState:
 
     _check_cancelled(state)
 
@@ -1060,19 +1073,89 @@ Rules:
 - Do not invent facts, policies, names, amounts, dates, or rules.
 - Only improve retrieval effectiveness.
 
-VECTOR:
+================================================
 
-Create a semantic retrieval query.
+VECTOR strategy:
 
-FTS:
+Create only a semantic retrieval query.
 
-Create a lexical search query.
+The query should:
 
-VECTOR_FTS:
+- capture the meaning of the question
+- add useful banking or credit-card terminology
+- expand concepts when helpful
 
-Create both.
+Example:
 
-Return only structured output.
+Question:
+"What are reward redemption options?"
+
+retrieval_query:
+"NorthStar credit card reward points redemption options,
+conversion values, and redemption methods"
+
+================================================
+
+FTS strategy:
+
+Create only a lexical search query.
+
+The query should:
+
+- preserve exact terms
+- preserve acronyms
+- preserve product names
+- remove conversational words
+
+Remove words like:
+what, why, how, explain, find, section, mentioned
+
+Example:
+
+Question:
+"What is MCC?"
+
+fts_query:
+"MCC Merchant Category Code"
+
+Question:
+"Where is Statement Credit mentioned?"
+
+fts_query:
+"Statement Credit"
+
+================================================
+
+VECTOR_FTS strategy:
+
+Create BOTH queries.
+
+retrieval_query:
+
+- semantic query for vector similarity search
+- include context and meaning
+
+fts_query:
+
+- keyword-focused query for PostgreSQL FTS
+- preserve exact document terminology
+
+Example:
+
+Question:
+"Explain reward points conversion and redemption options"
+
+retrieval_query:
+"NorthStar credit card reward points conversion,
+redemption options, redemption values and methods"
+
+fts_query:
+"reward points conversion redemption options
+Statement Credit Partner Vouchers Airline Miles"
+
+================================================
+
+Return only the structured output.
 """,
             ),
             (
@@ -1098,10 +1181,7 @@ Retrieval Strategy:
 
     result = chain.invoke(
         {
-            "history": state.get(
-                "messages",
-                [],
-            ),
+            "history": state.get("messages", []),
             "query": state["query"],
             "knowledge_strategy": state.get(
                 "knowledge_strategy",
@@ -1114,11 +1194,11 @@ Retrieval Strategy:
 
     print("========= QUERY REFORMULATION =========")
 
-    print(f"Original Query  : {state['query']}")
+    print(f"Original Query       : {state['query']}")
 
-    print(f"Retrieval Query : {result.retrieval_query}")
+    print(f"Retrieval Query      : {result.retrieval_query}")
 
-    print(f"FTS Query       : {result.fts_query}")
+    print(f"FTS Query            : {result.fts_query}")
 
     return {
         "retrieval_query": result.retrieval_query,
@@ -1131,9 +1211,7 @@ Retrieval Strategy:
 # ============================================================================
 
 
-def nl2sql_node(
-    state: RAGState,
-) -> RAGState:
+def nl2sql_node(state: RAGState) -> RAGState:
 
     _check_cancelled(state)
 
@@ -1153,43 +1231,70 @@ def nl2sql_node(
 You are an expert PostgreSQL SQL generator for a conversational
 NorthStar Credit Card Assistant.
 
-Generate ONE valid PostgreSQL SELECT query that answers the
-current user question using the database schema, business rules
-and conversation history.
+Generate ONE valid PostgreSQL SELECT query that answers the current
+user question using the database schema, business rules and
+conversation history.
 
-Rules:
+## Conversation and Entity Resolution
 
-- Use only tables and columns present in schema.
-- SELECT only.
-- Never generate INSERT, UPDATE, DELETE, DROP or DDL.
-- Return ONLY raw SQL.
-- Add LIMIT 50 unless aggregate.
-- Resolve references using conversation history.
-- Preserve entities and filters established in previous turns.
-- Do not broaden customer-specific queries.
+- Resolve references such as he, she, they, this customer, this card,
+  this transaction, the same one, or the previous one using conversation
+  history.
+- Preserve entities, identifiers and filters established in previous
+  turns.
+- If conversation history identifies the target entity, do not broaden
+  the query to unrelated entities.
+- Do not ask for clarification when the target can be resolved from the
+  available history.
 
-Reward point fields:
+## SQL Rules
 
-credit_cards.reward_points:
-Current reward point balance.
+- Use only tables and columns present in the supplied schema.
 
-card_transactions.reward_pts_earned:
-Points earned by individual transactions.
+- Generate only the SQL required to answer the question.
 
-reward_transactions.points_earned:
-Points posted through reward ledger.
+- Return ONLY raw SQL. No explanation, markdown or code fences.
 
-Do not treat these as interchangeable.
+- SELECT statements only.
 
-Avoid double-counting when joining multiple detail tables.
+- Never generate INSERT, UPDATE, DELETE, DROP or other DML/DDL.
 
-Before returning SQL verify:
+- Add LIMIT 50 unless the query is an aggregate.
+
+- For multi-word text searches, search meaningful keywords separately
+  rather than requiring the entire phrase to match.
+
+- Use appropriate synonyms when useful for text searches.
+
+Reward points have multiple meanings in the database:
+
+- credit_cards.reward_points:
+  Current reward-point balance on the card.
+
+- card_transactions.reward_pts_earned:
+  Reward points attributed to individual card transactions.
+
+- reward_transactions.points_earned:
+  Reward points posted through the reward ledger.
+
+Do not treat these fields as interchangeable.
+
+When aggregating data from multiple one-to-many tables, never directly
+join the detail tables and aggregate both sides in the same SELECT.
+Aggregate each detail table separately first, then join the aggregated
+results.
+
+Avoid double-counting caused by joining multiple transaction-level tables.
+
+## Final Validation
+
+Before returning SQL, verify:
 
 1. It answers the current question.
-2. References are resolved.
+2. Conversation references are resolved correctly.
 3. Required filters are present.
-4. Dataset is not unnecessarily broadened.
-5. SQL is valid PostgreSQL.
+4. The query does not unnecessarily broaden the dataset.
+5. The SQL is valid PostgreSQL.
 
 Database schema:
 
@@ -1213,13 +1318,12 @@ Current User Question:
 
     sql_chain = sql_prompt | llm
 
+    history = state.get("messages", [])
+
     raw_sql = sql_chain.invoke(
         {
             "schema": schema_info,
-            "history": state.get(
-                "messages",
-                [],
-            ),
+            "history": history,
             "question": state["query"],
         }
     )
@@ -1231,6 +1335,8 @@ Current User Question:
     print("======== GENERATED SQL QUERY ========")
 
     print(generated_sql)
+
+    _check_cancelled(state)
 
     try:
 
@@ -1250,15 +1356,21 @@ Current User Question:
 
     print("======================================")
 
+    # IMPORTANT:
+    #
+    # Do not return **state here.
+    #
+    # This node can execute in parallel with vector retrieval for HYBRID.
+    # Returning only fields produced by this node avoids unnecessarily
+    # overwriting state produced by the vector branch.
+
     return {
         "generated_sql": generated_sql,
         "sql_result": str(sql_result),
     }
 
 
-def route_after_nl2sql(
-    state: RAGState,
-) -> str:
+def route_after_nl2sql(state: RAGState) -> str:
 
     if state["route"] == "HYBRID":
 
@@ -1272,9 +1384,7 @@ def route_after_nl2sql(
 # ============================================================================
 
 
-def rerank_node(
-    state: RAGState,
-) -> RAGState:
+def rerank_node(state: RAGState) -> RAGState:
 
     _check_cancelled(state)
 
@@ -1282,10 +1392,7 @@ def rerank_node(
 
     co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
 
-    docs = state.get(
-        "retrieved_docs",
-        [],
-    )
+    docs = state.get("retrieved_docs", [])
 
     if not docs:
 
@@ -1329,9 +1436,7 @@ def rerank_node(
     }
 
 
-def route_after_rerank(
-    state: RAGState,
-) -> str:
+def route_after_rerank(state: RAGState) -> str:
 
     if state["route"] == "HYBRID":
 
@@ -1348,6 +1453,12 @@ def route_after_rerank(
 def merge_context_node(
     state: RAGState,
 ) -> RAGState:
+    """
+    Merge SQL results and Vector search results into one context
+    for answer generation.
+
+    This node does NOT call an LLM.
+    """
 
     _check_cancelled(state)
 
@@ -1363,10 +1474,7 @@ def merge_context_node(
 
     sql_context = ""
 
-    if route in (
-        "RDBMS",
-        "HYBRID",
-    ) and state.get("sql_result"):
+    if route in ("RDBMS", "HYBRID") and state.get("sql_result"):
 
         sql_context = f"""
 ==========================
@@ -1386,10 +1494,7 @@ SQL Result:
 
     vector_context = ""
 
-    if route in (
-        "VECTOR_DB",
-        "HYBRID",
-    ) and state.get("reranked_docs"):
+    if route in ("VECTOR_DB", "HYBRID") and state.get("reranked_docs"):
 
         vector_chunks = []
 
@@ -1421,9 +1526,11 @@ Page   : {page_no}
     contexts = []
 
     if sql_context:
+
         contexts.append(sql_context)
 
     if vector_context:
+
         contexts.append(vector_context)
 
     final_context = "\n\n".join(contexts)
@@ -1441,15 +1548,7 @@ Page   : {page_no}
     }
 
 
-# ============================================================================
-# GENERATE ANSWER
-# ============================================================================
-
-
-def generate_answer_node(
-    state: RAGState,
-) -> RAGState:
-
+def generate_answer_node(state: RAGState, config=None) -> RAGState:
     _check_cancelled(state)
 
     print("========= INSIDE GENERATE ANSWER NODE =========")
@@ -1465,7 +1564,7 @@ def generate_answer_node(
                 """
 You are the NorthStar Credit Card Assistant.
 
-Answer the user's question using ONLY the supplied retrieved context.
+Answer the user's question using ONLY the supplied context.
 
 The context may contain:
 
@@ -1481,6 +1580,7 @@ This may contain:
 - balances
 - reward points
 - transaction history
+- other customer-specific data
 
 2. KNOWLEDGE BASE
 
@@ -1495,48 +1595,65 @@ This may contain:
 - terms and conditions
 - product information
 
-Use the source relevant to the question.
+Use the source that is relevant to the user's question.
 
-If both sources are relevant, combine them.
+If both structured customer data and knowledge-base information
+are present and both are relevant, combine them.
 
 Do not invent information.
 
-Do not mention:
+Answer using only the supplied context.
 
-- SQL
-- databases
-- vector search
-- retrieval
-- prompts
-- internal systems
-- internal reasoning
+Preserve the exact meaning and scope of the source.
 
-Use conversation history to resolve references.
+Do not generalize, infer, or expand policy statements.
 
-Be concise and business-friendly.
+If the source says an exclusion applies to a specific portion,
+condition, transaction type, or circumstance, apply the exclusion
+only to that scope.
 
-USER PREFERENCE MEMORY:
+Do not convert:
 
-User Preference Memory contains long-term preferences,
-likes, dislikes, habits, choices, or defaults.
+"X portion is excluded"
 
-It MAY be used to personalize recommendations or presentation.
+into:
 
-It is NOT authoritative factual information.
+"X is excluded."
 
-Never use User Preference Memory as evidence for:
+Do not convert:
 
-- balances
-- transactions
-- spending
-- fees
-- reward rules
-- policies
-- eligibility
-- account information
-- customer-specific facts
+"X transactions are excluded"
 
-Retrieved Context is the factual authority.
+into:
+
+"all X spending is excluded."
+
+When a table and an explanatory note appear together, interpret them
+together and preserve both the earning rule and its exceptions.
+
+Use conversation history to resolve references such as:
+
+- he
+- she
+- they
+- this customer
+- this card
+- this transaction
+- the same one
+- the previous one
+- what about that
+- how about that
+
+Do not lose entities established in previous turns.
+
+- Be concise and business-friendly.
+- Use bullets when useful.
+- Explain numerical results clearly.
+- Do not mention SQL, databases, vector search, retrieval, prompts,
+  internal systems or internal reasoning.
+- Do not expose internal processing details.
+- If the context does not contain enough information to answer,
+  clearly say that the available information is insufficient.
 
 Populate:
 
@@ -1546,12 +1663,21 @@ Populate:
 - policy_citations
 - sql_query_executed
 
-For database-only answers, document fields may be empty.
+For database-only answers:
 
-For knowledge-base answers, populate document information
-when available.
+- document_name may be empty.
+- page_no may be empty.
+- policy_citations may be empty.
 
-For HYBRID answers, populate both when applicable.
+For knowledge-base answers:
+
+- populate document_name and page_no when available.
+- populate policy_citations when appropriate.
+
+For HYBRID answers:
+
+- populate both database-related and document-related fields
+  when applicable.
 """,
             ),
             (
@@ -1569,11 +1695,18 @@ Retrieved Context:
 
 {context}
 
-User Preference Memory:
+User Preference Memory (personalization context only):
 
 {user_preferences}
 
-Previous Evaluation Feedback:
+Important: User Preference Memory describes the user's preferences,
+likes, dislikes, habits, or defaults. It may be used to personalize
+recommendations and presentation, but it is NOT an authoritative source
+for balances, transactions, fees, reward rules, policies, eligibility,
+or any other factual product/customer information. Retrieved Context
+remains the factual authority for those claims.
+
+Previous Evaluation Feedback (if any):
 
 {feedback}
 """,
@@ -1581,7 +1714,185 @@ Previous Evaluation Feedback:
         ]
     )
 
+    # ------------------------------------------------------------------------
+    # STREAMING ANSWER PATH
+    #
+    # The normal path below remains unchanged and uses structured output.
+    # For the streaming endpoint, the answer itself must come from the
+    # underlying ChatOpenAI stream.  A structured-output wrapper is useful for
+    # correctness/metadata, but it does not expose the answer text as token
+    # events through our current graph stream.
+    #
+    # We therefore:
+    #   1. stream the natural-language answer from the base LLM internally;
+    #   2. collect the complete generated answer without exposing it to the UI;
+    #   3. run the existing structured-output call to populate metadata;
+    #   4. overwrite the structured response's answer with the exact generated
+    #      text so evaluation sees exactly what was generated;
+    #   5. only after the graph reaches its final evaluated state does the
+    #      streaming entry point expose the approved answer to the UI.
+    #
+    # The metadata call is intentionally kept because document/page/citation
+    # and SQL fields are part of the existing functionality.
+    # ------------------------------------------------------------------------
+
+    is_streaming = bool(
+        config and config.get("configurable", {}).get("streaming", False)
+    )
+
+    history = state.get("messages", [])
+
+    if is_streaming:
+        _check_cancelled(state)
+        _emit_progress("Preparing your answer...")
+
+        # Use the same source-accuracy instructions as the existing prompt,
+        # but explicitly request answer text only for the live stream.
+        stream_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """
+You are the NorthStar Credit Card Assistant.
+
+Answer the user's question using ONLY the supplied context.
+
+Preserve the exact meaning and scope of the source. Do not invent,
+generalize, infer, or expand policy statements. Preserve exceptions,
+qualifiers, transaction scopes, dates, amounts, and other constraints.
+
+Use conversation history to resolve references such as "this customer",
+"this card", "the previous one", or similar follow-ups.
+
+Be concise and business-friendly. Use bullets when useful. Explain
+numerical results clearly.
+
+Do not mention SQL, databases, vector search, retrieval, prompts,
+internal systems, or internal reasoning.
+
+If the supplied context is insufficient, clearly say that the available
+information is insufficient.
+
+IMPORTANT:
+Return ONLY the natural-language answer to the user's question.
+Do not return JSON. Do not return field names such as answer,
+document_name, page_no, policy_citations, or sql_query_executed.
+""",
+                ),
+                (
+                    "human",
+                    """
+Conversation History:
+
+{history}
+
+Current User Question:
+
+{query}
+
+Retrieved Context:
+
+{context}
+
+Previous Evaluation Feedback (if any):
+
+{feedback}
+""",
+                ),
+            ]
+        )
+
+        stream_chain = stream_prompt | llm
+
+        streamed_answer_parts = []
+
+        for chunk in stream_chain.stream(
+            {
+                "query": state["query"],
+                "context": state.get("final_context", ""),
+                "history": history,
+                "feedback": state.get(
+                    "evaluation_feedback",
+                    "",
+                ),
+            }
+        ):
+            _check_cancelled(state)
+
+            content = getattr(chunk, "content", "")
+
+            # ChatOpenAI normally returns a string here. Be defensive about
+            # providers/chunk formats that may return a list of content blocks.
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    item.get("text", "") for item in content if isinstance(item, dict)
+                )
+            else:
+                text = str(content) if content else ""
+
+            if text:
+                # Buffer the generated answer internally.
+                # Do NOT expose these chunks to the UI yet because this
+                # answer still has to pass through evaluate_answer_node().
+                streamed_answer_parts.append(text)
+
+        streamed_answer = "".join(streamed_answer_parts).strip()
+
+        _check_cancelled(state)
+
+        # Populate the existing structured response fields without allowing
+        # the second call to replace the exact text already streamed to UI.
+        metadata_prompt = ChatPromptTemplate.from_messages(
+            [
+                *prompt.messages,
+                (
+                    "human",
+                    """
+The generated answer is:
+
+{streamed_answer}
+
+Use this exact text as the `answer` field. Do not rewrite it.
+Populate the remaining response fields from the supplied context.
+""",
+                ),
+            ]
+        )
+
+        metadata_chain = metadata_prompt | structured_llm
+
+        metadata_result = metadata_chain.invoke(
+            {
+                "query": state["query"],
+                "context": state.get("final_context", ""),
+                "history": history,
+                "feedback": state.get(
+                    "evaluation_feedback",
+                    "",
+                ),
+                "streamed_answer": streamed_answer,
+            }
+        )
+
+        _check_cancelled(state)
+
+        response = metadata_result.model_dump()
+        response["answer"] = streamed_answer
+
+        if state.get("generated_sql"):
+            response["sql_query_executed"] = state["generated_sql"]
+
+        print("[generate_answer_node] Streaming answer generated.")
+
+        return {
+            "response": response,
+        }
+
     chain = prompt | structured_llm
+
+    history = state.get("messages", [])
 
     result = chain.invoke(
         {
@@ -1590,10 +1901,7 @@ Previous Evaluation Feedback:
                 "final_context",
                 "",
             ),
-            "history": state.get(
-                "messages",
-                [],
-            ),
+            "history": history,
             "user_preferences": state.get(
                 "user_preferences",
                 "",
@@ -1608,6 +1916,10 @@ Previous Evaluation Feedback:
     _check_cancelled(state)
 
     response = result.model_dump()
+
+    # Preserve the SQL query generated during this turn.
+    #
+    # This is useful for RDBMS and HYBRID responses.
 
     if state.get("generated_sql"):
 
@@ -1632,16 +1944,13 @@ def evaluate_answer_node(
     _check_cancelled(state)
 
     print("========= INSIDE EVALUATE ANSWER NODE =========")
+    # if state.get("evaluate_count", 0) == 0:
 
-    if (
-        state.get(
-            "evaluate_count",
-            0,
-        )
-        == 0
-    ):
+    #     _emit_progress("Preparing your answer...")
 
-        _emit_progress("Preparing your answer...")
+    print("========= ANSWER BEING EVALUATED =========")
+
+    print(state["response"])
 
     evaluate_count = (
         state.get(
@@ -1650,6 +1959,8 @@ def evaluate_answer_node(
         )
         + 1
     )
+
+    print(f"Evaluation attempt number: " f"{evaluate_count}")
 
     llm = _get_evaluator_llm()
 
@@ -1680,37 +1991,38 @@ REGENERATE if:
 
 IMPORTANT:
 
-Use only the retrieved context as factual authority.
+Use only the retrieved context as the factual authority.
 
-Do not substitute general knowledge.
+Do not substitute general knowledge for retrieved information.
 
-Do not broaden or narrow policy statements.
+Do not broaden or narrow the scope of a policy statement.
 
-Do not blindly trust numerical results produced by SQL.
+Evaluate strictly against the retrieved context and preserve the exact
+scope of qualifiers, conditions and exceptions.
 
+Do not broaden a specific exclusion into a broader exclusion.
+
+The evaluator must not blindly trust numerical results produced by SQL.
 Check for obvious aggregation inconsistencies, duplicated counts,
-conflicting metrics, or misuse of fields when enough context exists.
+conflicting metrics, or misuse of fields when the retrieved context
+contains enough information to identify the correct metric.
 
-USER PREFERENCE MEMORY:
+Preserve qualifiers such as:
 
-User Preference Memory may explain user preferences,
-likes, dislikes, habits, choices or desired personalization.
+- only
+- except
+- portion
+- subject to
+- up to
+- minimum
+- maximum
+- per transaction
+- per statement
+- per month
+- per year
 
-It is NOT factual evidence.
-
-Do not use it to validate:
-
-- balances
-- transactions
-- spending
-- fees
-- reward rules
-- policies
-- eligibility
-- customer facts
-
-Use User Preference Memory only to determine whether the answer
-appropriately respects the user's stated preferences when relevant.
+When the source contains a specific exception, preserve that exception
+rather than generalizing it to the entire category.
 """,
             ),
             (
@@ -1728,9 +2040,16 @@ Retrieved Context:
 
 {context}
 
-User Preference Memory:
+User Preference Memory (personalization context only):
 
 {user_preferences}
+
+Important: User Preference Memory may explain the user's preferences
+or desired personalization. It must NOT be used as factual evidence
+for balances, transactions, fees, reward rules, policies, eligibility,
+or other product/customer facts. Evaluate factual claims against the
+Retrieved Context. Use preferences only to determine whether the answer
+appropriately respects the user's stated preferences when relevant.
 
 Generated Answer:
 
@@ -1746,6 +2065,8 @@ Previous Evaluation Feedback:
 
     chain = prompt | structured_llm
 
+    history = state.get("messages", [])
+
     answer = state.get(
         "response",
         {},
@@ -1754,6 +2075,10 @@ Previous Evaluation Feedback:
         "",
     )
 
+    print("========= ANSWER SENT TO EVALUATOR =========")
+
+    print(answer)
+
     result = chain.invoke(
         {
             "query": state["query"],
@@ -1761,10 +2086,7 @@ Previous Evaluation Feedback:
                 "final_context",
                 "",
             ),
-            "history": state.get(
-                "messages",
-                [],
-            ),
+            "history": history,
             "user_preferences": state.get(
                 "user_preferences",
                 "",
@@ -1782,6 +2104,18 @@ Previous Evaluation Feedback:
     print("========= EVALUATOR RESULT =========")
 
     print(f"[evaluate_answer_node] " f"{result.evaluation}")
+
+    print(result)
+
+    # ----------------------------------------------------------
+    # Only persist the assistant answer when evaluation is final.
+    #
+    # If evaluation #1 says REGENERATE, do NOT add the answer
+    # to conversation history because it will be replaced.
+    #
+    # If evaluation PASSes, or evaluation #2 fails and we stop,
+    # the current answer becomes the final answer for this turn.
+    # ----------------------------------------------------------
 
     update = {
         "evaluation": result.evaluation,
@@ -1832,8 +2166,17 @@ def should_reformulate_after_search(
         "VECTOR",
     )
 
+    # ------------------------------------------------------------------
+    # Never reformulate more than once
+    # ------------------------------------------------------------------
+
     if attempt >= 2:
+
         return False
+
+    # ------------------------------------------------------------------
+    # No results
+    # ------------------------------------------------------------------
 
     if not docs:
 
@@ -1845,25 +2188,47 @@ def should_reformulate_after_search(
 
         return True
 
+    # ------------------------------------------------------------------
+    # Strategy-specific scoring
+    # ------------------------------------------------------------------
+
     if strategy == "VECTOR":
 
         score_key = "similarity"
+
         threshold = 0.50
 
     elif strategy == "FTS":
 
         score_key = "fts_rank"
+
+        # FTS scores are much smaller than vector similarity scores.
+        # Tune this based on your observed PostgreSQL ts_rank values.
+
         threshold = 0.05
 
     elif strategy == "VECTOR_FTS":
 
+        # RRF scores are lower magnitude than vector similarity.
+        # Tune threshold based on observed reciprocal rank values.
         score_key = "rrf_score"
         threshold = 0.01
 
     else:
 
+        print(
+            "[retrieval_quality] "
+            f"Unknown strategy {strategy}. "
+            "Defaulting to VECTOR scoring."
+        )
+
         score_key = "similarity"
+
         threshold = 0.50
+
+    # ------------------------------------------------------------------
+    # Calculate relevant documents
+    # ------------------------------------------------------------------
 
     relevant_docs = [
         doc
@@ -1884,6 +2249,10 @@ def should_reformulate_after_search(
         f"Attempt: {attempt}"
     )
 
+    # ------------------------------------------------------------------
+    # Quality decision
+    # ------------------------------------------------------------------
+
     if len(relevant_docs) < 3:
 
         print(
@@ -1892,7 +2261,11 @@ def should_reformulate_after_search(
 
         return True
 
-    print("[retrieval_quality] " "Retrieval quality is sufficient.")
+    print(
+        "[retrieval_quality] "
+        "Retrieval quality is sufficient. "
+        "Skipping reformulation."
+    )
 
     return False
 
@@ -1934,19 +2307,20 @@ def route_after_evaluation(
     return "END"
 
 
-def route_knowledge_strategy(
-    state: RAGState,
-):
+def route_knowledge_strategy(state: RAGState):
 
     strategy = state.get("knowledge_strategy")
 
     if strategy == "VECTOR":
+
         return "VECTOR"
 
     if strategy == "FTS":
+
         return "FTS"
 
     if strategy == "VECTOR_FTS":
+
         return "VECTOR_FTS"
 
     return "VECTOR"
@@ -1961,9 +2335,11 @@ def route_after_reformulation(
     print(f"[route_after_reformulation] " f"Strategy: {strategy}")
 
     if strategy == "FTS":
+
         return "fts_search"
 
     if strategy == "VECTOR_FTS":
+
         return "vector_fts_search"
 
     return "vector_search"
@@ -2019,17 +2395,17 @@ def build_rag_graph():
     workflow = StateGraph(RAGState)
 
     # ------------------------------------------------------------------------
-    # MEMORY
+    # Nodes
     # ------------------------------------------------------------------------
+
+    # Memory / personalization
 
     workflow.add_node(
         "memory",
         memory_node,
     )
 
-    # ------------------------------------------------------------------------
-    # ROUTER
-    # ------------------------------------------------------------------------
+    # Primary routing
 
     workflow.add_node(
         "router",
@@ -2037,7 +2413,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # HYBRID
+    # Existing Hybrid (Vector + RDBMS)
     # ------------------------------------------------------------------------
 
     workflow.add_node(
@@ -2070,7 +2446,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # KNOWLEDGE RETRIEVAL
+    # Knowledge Retrieval Layer
     # ------------------------------------------------------------------------
 
     workflow.add_node(
@@ -2099,7 +2475,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # RETRIEVAL IMPROVEMENT
+    # Retrieval Improvement
     # ------------------------------------------------------------------------
 
     workflow.add_node(
@@ -2113,7 +2489,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # ANSWER
+    # Answer Generation
     # ------------------------------------------------------------------------
 
     workflow.add_node(
@@ -2132,20 +2508,22 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # START
+    # Entry Point
     # ------------------------------------------------------------------------
 
     workflow.set_entry_point("memory")
 
-    # START → MEMORY → ROUTER
-
-    workflow.add_edge(
-        "memory",
-        "router",
-    )
+    # Memory always runs before routing.
+    workflow.add_edge("memory", "router")
 
     # ------------------------------------------------------------------------
     # PRIMARY ROUTER
+    #
+    # Decides:
+    # VECTOR_DB
+    # RDBMS
+    # HYBRID
+    # DIRECT
     # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
@@ -2160,7 +2538,12 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # KNOWLEDGE STRATEGY
+    # KNOWLEDGE RETRIEVAL STRATEGY ROUTER
+    #
+    # Decides:
+    # VECTOR
+    # FTS
+    # VECTOR_FTS
     # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
@@ -2174,7 +2557,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # HYBRID
+    # EXISTING VECTOR + RDBMS HYBRID FLOW
     # ------------------------------------------------------------------------
 
     workflow.add_edge(
@@ -2188,7 +2571,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # NL2SQL
+    # NL2SQL ROUTING
     # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
@@ -2201,7 +2584,16 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # SEARCH → ATTEMPT
+    # RETRIEVAL FLOW
+    #
+    # Search
+    #    |
+    # Increment attempt
+    #    |
+    # Decide:
+    #       Reformulate
+    #       Continue
+    #
     # ------------------------------------------------------------------------
 
     workflow.add_edge(
@@ -2229,7 +2621,15 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # REFORMULATION
+    # QUERY REFORMULATION RETRY
+    #
+    # Important:
+    # Retry the SAME retrieval strategy
+    #
+    # VECTOR  -> vector_search
+    # FTS     -> fts_search
+    # VECTOR_FTS -> vector_fts_search
+    #
     # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
@@ -2243,7 +2643,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # RERANK
+    # RERANKING
     # ------------------------------------------------------------------------
 
     workflow.add_conditional_edges(
@@ -2256,7 +2656,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # HYBRID JOIN
+    # EXISTING HYBRID JOIN
     # ------------------------------------------------------------------------
 
     workflow.add_edge(
@@ -2273,7 +2673,7 @@ def build_rag_graph():
     )
 
     # ------------------------------------------------------------------------
-    # ANSWER GENERATION
+    # RESPONSE GENERATION
     # ------------------------------------------------------------------------
 
     workflow.add_edge(
@@ -2396,6 +2796,10 @@ def run_search_agent(
             config=config,
         )
 
+        # ====================================================================
+        # FINAL RESPONSE GUARDRAIL
+        # ====================================================================
+
         response = final_state["response"]
 
         return response
@@ -2418,14 +2822,16 @@ async def run_search_agent_stream(
     """
     Execute the RAG graph while exposing:
 
-    - progress events
-    - final response
+    - intermediate progress events from _emit_progress()
+    - approved final answer as token-like UI chunks
+    - final structured response
     - cancellation events
     - errors
 
-    Memory lookup runs first.
+    Memory lookup runs first for the authenticated user.
 
-    DIRECT queries terminate at router.
+    DIRECT queries terminate at the router node.
+    Retrieval queries continue through the normal RAG flow.
     """
 
     print("============ INSIDE run_search_agent_stream ============")
@@ -2459,6 +2865,7 @@ async def run_search_agent_stream(
     config = {
         "configurable": {
             "thread_id": thread_id,
+            "streaming": True,
         }
     }
 
@@ -2478,37 +2885,54 @@ async def run_search_agent_stream(
             version="v2",
         ):
 
-            # ----------------------------------------------------------------
+            # ================================================================
             # CUSTOM EVENTS
-            # ----------------------------------------------------------------
+            #
+            # These come directly from _emit_progress()
+            # ================================================================
 
             if chunk["type"] == "custom":
 
                 data = chunk["data"]
 
-                if isinstance(data, dict) and data.get("event") == "progress":
+                if isinstance(data, dict):
+                    event_type = data.get("event")
 
-                    message = data.get(
-                        "message",
-                        "",
-                    )
+                    if event_type == "progress":
+                        message = data.get(
+                            "message",
+                            "",
+                        )
 
-                    if message:
+                        if message:
+                            print("[run_search_agent_stream] " f"Progress: {message}")
+                            yield {
+                                "event": "progress",
+                                "message": message,
+                            }
 
-                        print("[run_search_agent_stream] " f"Progress: {message}")
+                    elif event_type == "token":
+                        content = data.get("content", "")
 
+                        if content:
+                            yield {
+                                "event": "token",
+                                "content": content,
+                            }
+
+                    elif event_type == "reset":
                         yield {
-                            "event": "progress",
-                            "message": message,
+                            "event": "reset",
                         }
 
                 continue
 
-            # ----------------------------------------------------------------
+            # ================================================================
             # NODE UPDATES
-            # ----------------------------------------------------------------
+            # ================================================================
 
             if chunk["type"] != "updates":
+
                 continue
 
             updates = chunk["data"]
@@ -2517,6 +2941,7 @@ async def run_search_agent_stream(
                 updates,
                 dict,
             ):
+
                 continue
 
             for (
@@ -2528,11 +2953,14 @@ async def run_search_agent_stream(
                     node_update,
                     dict,
                 ):
+
                     continue
 
-                # ------------------------------------------------------------
+                # ============================================================
                 # ROUTER
-                # ------------------------------------------------------------
+                #
+                # DIRECT queries end here.
+                # ============================================================
 
                 if node_name == "router":
 
@@ -2548,13 +2976,30 @@ async def run_search_agent_stream(
 
                             final_response = response
 
+                            direct_answer = response.get("answer", "")
+
+                            if direct_answer:
+                                # DIRECT answers terminate at the router and do
+                                # not pass through evaluation. They are therefore
+                                # safe to stream immediately.
+                                for start in range(0, len(direct_answer), 12):
+                                    raise_if_query_cancelled(thread_id)
+                                    yield {
+                                        "event": "token",
+                                        "content": direct_answer[start : start + 12],
+                                    }
+                                    await asyncio.sleep(0.02)
+
                             print(
                                 "[run_search_agent_stream] " "DIRECT response captured."
                             )
 
-                # ------------------------------------------------------------
+                # ============================================================
                 # GENERATE ANSWER
-                # ------------------------------------------------------------
+                #
+                # RDBMS / VECTOR / HYBRID queries eventually
+                # produce their response here.
+                # ============================================================
 
                 elif node_name == "generate_answer":
 
@@ -2566,9 +3011,12 @@ async def run_search_agent_stream(
 
                         print("[run_search_agent_stream] " "Answer generated.")
 
-                # ------------------------------------------------------------
-                # OTHER RESPONSE-PRODUCING NODES
-                # ------------------------------------------------------------
+                # ============================================================
+                # OTHER NODE RESPONSES
+                #
+                # If a future node directly produces the final response,
+                # this allows us to capture it without changing the design.
+                # ============================================================
 
                 elif "response" in node_update:
 
@@ -2578,15 +3026,15 @@ async def run_search_agent_stream(
 
                         final_response = response
 
-            # ----------------------------------------------------------------
+            # ================================================================
             # CANCELLATION
-            # ----------------------------------------------------------------
+            # ================================================================
 
             raise_if_query_cancelled(thread_id)
 
-        # --------------------------------------------------------------------
+        # ====================================================================
         # FINAL RESPONSE
-        # --------------------------------------------------------------------
+        # ====================================================================
 
         if final_response is None:
 
@@ -2595,6 +3043,36 @@ async def run_search_agent_stream(
             )
 
         print("[run_search_agent_stream] " f"Final route: {selected_route}")
+
+        # --------------------------------------------------------------------
+        # APPROVED ANSWER STREAM
+        # --------------------------------------------------------------------
+        #
+        # For RDBMS / VECTOR / HYBRID queries, generate_answer_node() buffers
+        # the answer and evaluate_answer_node() decides whether it is accepted
+        # or needs regeneration. Therefore, nothing from the generated answer
+        # is sent to the UI until the graph has reached its final state.
+        #
+        # At this point final_response is the authoritative response: either
+        # evaluation passed or the second evaluation attempt was reached.
+        # Stream that approved answer to the existing UI in small chunks.
+        # The short delay is intentional: without it all chunks can arrive in
+        # the same event-loop turn, causing the Streamlit queue to receive the
+        # whole answer before its 200ms fragment gets a chance to render it.
+        # --------------------------------------------------------------------
+
+        approved_answer = final_response.get("answer", "")
+
+        if selected_route != "DIRECT" and approved_answer:
+            for start in range(0, len(approved_answer), 12):
+                raise_if_query_cancelled(thread_id)
+
+                yield {
+                    "event": "token",
+                    "content": approved_answer[start : start + 12],
+                }
+
+                await asyncio.sleep(0.02)
 
         yield {
             "event": "final",

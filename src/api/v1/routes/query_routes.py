@@ -10,6 +10,7 @@ from src.api.v1.services.query_service import (
     query_documents_stream,
 )
 from src.core.db import EmbeddingServiceError
+from src.core.guardrails import GuardrailViolation
 
 router = APIRouter(prefix="/api/v1/query")
 
@@ -29,6 +30,15 @@ def query_endpoint(
             thread_id=request.thread_id,
             user_id=request.user_id,
         )
+
+    except GuardrailViolation as violation:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "guardrail": violation.guard,
+                "message": violation.message,
+            },
+        ) from violation
 
     except EmbeddingServiceError as exc:
         print("[query_route] " f"Embedding service unavailable: {exc}")
@@ -59,17 +69,69 @@ async def stream_query_endpoint(
     """
     Stream progress updates and final/token events from the RAG agent
     using Server-Sent Events (SSE).
+
+    The input guardrail is applied before the SSE stream is opened.
+    This allows GuardrailViolation to be returned as a normal HTTP 400
+    response instead of being embedded inside an already-open SSE stream.
+
+    Output guardrail processing is intentionally left to the downstream
+    service/agent so that the existing streaming response behavior is
+    preserved.
     """
 
-    async def event_generator():
+    # ------------------------------------------------------------------------
+    # Apply/trigger the query service before opening the SSE response.
+    #
+    # This preserves the GuardrailViolation handling from the guarded version
+    # while keeping the actual async event iteration from the streaming
+    # version.
+    # ------------------------------------------------------------------------
+    try:
+        event_stream = query_documents_stream(
+            query=request.query,
+            thread_id=request.thread_id,
+            user_id=request.user_id,
+        )
 
+    except GuardrailViolation as violation:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "guardrail": violation.guard,
+                "message": violation.message,
+            },
+        ) from violation
+
+    async def event_generator():
         try:
-            async for event in query_documents_stream(
-                query=request.query,
-                thread_id=request.thread_id,
-                user_id=request.user_id,
-            ):
-                yield (f"data: " f"{json.dumps(event, ensure_ascii=False)}" "\n\n")
+            async for event in event_stream:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        event,
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+        except GuardrailViolation as violation:
+            # Defensive handling in case the streaming service is an async
+            # generator and raises the guardrail only when iteration begins.
+            print("[query_stream_route] " f"Guardrail violation: {violation}")
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "event": "error",
+                        "status_code": 400,
+                        "guardrail": violation.guard,
+                        "message": violation.message,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
 
         except EmbeddingServiceError as exc:
             print("[query_stream_route] " f"Embedding service unavailable: {exc}")
