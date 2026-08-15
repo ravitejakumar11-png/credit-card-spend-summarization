@@ -34,6 +34,34 @@ load_dotenv()
 
 
 # ============================================================================
+# LANGSMITH TRACING
+# ============================================================================
+
+
+def _get_trace_config(
+    thread_id: str,
+    run_name: str,
+) -> dict:
+    """
+    Build a small LangSmith tracing config for individual LLM calls.
+
+    The LangGraph node itself is already traced by LangGraph. These names
+    make the nested LLM calls easy to identify without changing the graph
+    flow or node behavior.
+    """
+    return {
+        "run_name": run_name,
+        "tags": [
+            "northstar",
+            "rag",
+        ],
+        "metadata": {
+            "thread_id": thread_id,
+        },
+    }
+
+
+# ============================================================================
 # CANCELLATION
 # ============================================================================
 
@@ -133,7 +161,8 @@ def _emit_stream_reset() -> None:
 def _get_router_llm():
 
     return ChatOpenAI(
-        model="gpt-4o-mini",
+        # model="gpt-4o-mini", # model="gpt-4o-mini",
+        model=os.getenv("OPENAI_CHAT_MODEL"),
         api_key=os.getenv("OPENAI_API_KEY"),
         temperature=0,
     )
@@ -379,6 +408,7 @@ def retrieve_user_preferences_from_mem0(
 def detect_user_preference(
     query: str,
     history: list,
+    trace_config: dict | None = None,
 ) -> UserPreferenceDecision:
     """
     Detect whether the current user message contains a long-term
@@ -590,7 +620,12 @@ Current User Message:
         {
             "history": history,
             "query": query,
-        }
+        },
+        config=trace_config
+        or _get_trace_config(
+            "",
+            "Memory Preference Detection",
+        ),
     )
 
 
@@ -641,6 +676,10 @@ def memory_node(
     preference_decision = detect_user_preference(
         query=query,
         history=history,
+        trace_config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Memory Preference Detection",
+        ),
     )
 
     _check_cancelled(state)
@@ -1158,7 +1197,11 @@ Do not invent information that is not present in User Preference Memory.
             "query": query,
             "history": history,
             "user_preferences": user_preferences,
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Query Router LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -1429,7 +1472,11 @@ Current User Question:
                 "messages",
                 [],
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Knowledge Strategy LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -1470,7 +1517,7 @@ def query_optimization_node(
 
     print("========= INSIDE QUERY REFORMULATION NODE =========")
 
-    llm = _get_router_llm()
+    llm = _get_llm()
 
     structured_llm = llm.with_structured_output(RetrievalQueryDecision)
 
@@ -1612,7 +1659,11 @@ Retrieval Strategy:
                 "knowledge_strategy",
                 "VECTOR",
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Query Optimization LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -1751,7 +1802,11 @@ Current User Question:
             "schema": schema_info,
             "history": history,
             "question": state["query"],
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "NL2SQL LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -2328,7 +2383,11 @@ Previous Evaluation Feedback:
                     "evaluation_feedback",
                     "",
                 ),
-            }
+            },
+            config=_get_trace_config(
+                state.get("thread_id", ""),
+                "Answer Generation LLM - Streaming",
+            ),
         ):
 
             _check_cancelled(state)
@@ -2414,7 +2473,11 @@ Populate the remaining response fields from the supplied context.
                     "",
                 ),
                 "streamed_answer": streamed_answer,
-            }
+            },
+            config=_get_trace_config(
+                state.get("thread_id", ""),
+                "Answer Metadata LLM - Streaming",
+            ),
         )
 
         _check_cancelled(state)
@@ -2455,7 +2518,11 @@ Populate the remaining response fields from the supplied context.
                 "evaluation_feedback",
                 "",
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Answer Generation LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -2645,7 +2712,11 @@ Previous Evaluation Feedback:
                 "evaluation_feedback",
                 "",
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Answer Evaluation LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -3270,7 +3341,16 @@ def run_search_agent(
     config = {
         "configurable": {
             "thread_id": thread_id,
-        }
+        },
+        "run_name": "NorthStar RAG Query",
+        "tags": [
+            "northstar",
+            "rag",
+            "non-streaming",
+        ],
+        "metadata": {
+            "thread_id": thread_id,
+        },
     }
 
     try:
@@ -3346,7 +3426,16 @@ async def run_search_agent_stream(
         "configurable": {
             "thread_id": thread_id,
             "streaming": True,
-        }
+        },
+        "run_name": "NorthStar RAG Query",
+        "tags": [
+            "northstar",
+            "rag",
+            "streaming",
+        ],
+        "metadata": {
+            "thread_id": thread_id,
+        },
     }
 
     final_response = None
