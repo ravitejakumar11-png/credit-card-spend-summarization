@@ -50,6 +50,62 @@ if "thread_id" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
 
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+
+# ============================================================================
+# User Login Gate
+# ============================================================================
+
+# Login happens before the chat UI is displayed.
+# User preferences are loaded only after Login/Guest selection.
+
+if not st.session_state.authenticated:
+
+    st.subheader("Welcome to NorthStar Credit Card Assistant")
+
+    st.write(
+        "Please login with your User ID to enable personalized preferences, "
+        "or continue as a guest."
+    )
+
+    login_user_id = st.text_input(
+        "User ID",
+        placeholder="e.g. C-1001",
+        help=(
+            "Enter a user ID to enable persistent Mem0 preferences. "
+            "No username/password validation is performed."
+        ),
+    )
+
+    login_col, guest_col = st.columns(2)
+
+    with login_col:
+        if st.button("Login", use_container_width=True):
+            login_user_id = login_user_id.strip()
+
+            if login_user_id:
+                st.session_state.user_id = login_user_id
+                st.session_state.authenticated = True
+                _start_new_thread()
+                st.rerun()
+            else:
+                st.warning("Please enter a User ID.")
+
+    with guest_col:
+        if st.button("Continue as Guest", use_container_width=True):
+            st.session_state.user_id = ""
+            st.session_state.authenticated = True
+            _start_new_thread()
+            st.rerun()
+
+    st.caption(
+        "Guest requests use an empty user_id. " "Login accepts any non-empty User ID."
+    )
+
+    st.stop()
+
 
 # ============================================================================
 # Chat history
@@ -285,65 +341,26 @@ def _execute_query_request(
 
 with st.sidebar:
 
-    # ========================================================================
-    # User Login
-    # ========================================================================
-
-    st.header("User Login")
+    st.header("User")
 
     if st.session_state.user_id:
         st.success(f"Logged in as: {st.session_state.user_id}")
-
-        if st.button(
-            "Logout",
-            use_container_width=True,
-            disabled=st.session_state.query_running,
-        ):
-            st.session_state.user_id = ""
-            _start_new_thread()
-            st.rerun()
-
     else:
-        login_user_id = st.text_input(
-            "User ID",
-            placeholder="e.g. C-1001",
-            help=(
-                "Enter a user ID to enable persistent Mem0 preferences. "
-                "No username/password validation is performed."
-            ),
-        )
+        st.info("Using Guest mode")
 
-        login_col, guest_col = st.columns(2)
+    if st.button(
+        "Logout",
+        use_container_width=True,
+        disabled=st.session_state.query_running,
+    ):
+        st.session_state.user_id = ""
+        st.session_state.authenticated = False
+        _start_new_thread()
+        st.rerun()
 
-        with login_col:
-            if st.button(
-                "Login",
-                use_container_width=True,
-                disabled=st.session_state.query_running,
-            ):
-                login_user_id = login_user_id.strip()
+    st.divider()
 
-                if login_user_id:
-                    st.session_state.user_id = login_user_id
-                    _start_new_thread()
-                    st.rerun()
-                else:
-                    st.warning("Please enter a User ID.")
-
-        with guest_col:
-            if st.button(
-                "Continue as Guest",
-                use_container_width=True,
-                disabled=st.session_state.query_running,
-            ):
-                st.session_state.user_id = ""
-                _start_new_thread()
-                st.rerun()
-
-    st.caption(
-        "Guest requests use an empty user_id. " "Login accepts any non-empty User ID."
-    )
-
+    # ========================================================================
     st.header("Developer Mode")
 
     developer_mode = st.toggle(

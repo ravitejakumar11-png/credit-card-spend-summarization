@@ -34,6 +34,34 @@ load_dotenv()
 
 
 # ============================================================================
+# LANGSMITH TRACING
+# ============================================================================
+
+
+def _get_trace_config(
+    thread_id: str,
+    run_name: str,
+) -> dict:
+    """
+    Build a small LangSmith tracing config for individual LLM calls.
+
+    The LangGraph node itself is already traced by LangGraph. These names
+    make the nested LLM calls easy to identify without changing the graph
+    flow or node behavior.
+    """
+    return {
+        "run_name": run_name,
+        "tags": [
+            "northstar",
+            "rag",
+        ],
+        "metadata": {
+            "thread_id": thread_id,
+        },
+    }
+
+
+# ============================================================================
 # CANCELLATION
 # ============================================================================
 
@@ -133,7 +161,8 @@ def _emit_stream_reset() -> None:
 def _get_router_llm():
 
     return ChatOpenAI(
-        model="gpt-4o-mini",
+        # model="gpt-4o-mini", # model="gpt-4o-mini",
+        model=os.getenv("OPENAI_CHAT_MODEL"),
         api_key=os.getenv("OPENAI_API_KEY"),
         temperature=0,
     )
@@ -379,6 +408,7 @@ def retrieve_user_preferences_from_mem0(
 def detect_user_preference(
     query: str,
     history: list,
+    trace_config: dict | None = None,
 ) -> UserPreferenceDecision:
     """
     Detect whether the current user message contains a long-term
@@ -400,18 +430,46 @@ You are a user-preference detection component for the
 NorthStar Credit Card Assistant.
 
 Determine whether the CURRENT USER MESSAGE contains information
-that should be remembered as a long-term user preference, like,
-dislike, habit, choice, or personal preference.
+that should be remembered as a long-term user preference, behavioral
+pattern, habit, choice, or personal preference.
+
+Your task is ONLY to detect and extract user preferences.
+
+Do not answer the user's question.
 
 A preference should be detected when the user explicitly or
-implicitly tells the assistant something they:
+implicitly tells the assistant something that describes their:
 
-- like
-- dislike
-- prefer
-- usually do
-- want remembered
-- want as a default
+- likes
+- dislikes
+- preferences
+- habits
+- recurring behaviors
+- usage patterns
+- choices
+- defaults
+- recommendation criteria
+- things they want to avoid
+
+
+IMPORTANT INTENT RULE:
+
+A user message may contain BOTH:
+
+1. A preference or behavioral signal
+2. A question or request that requires an answer
+
+Extract the preference independently from the user's request.
+
+Do NOT ignore preference information just because the user is also
+asking for:
+
+- a recommendation
+- a comparison
+- advice
+- a product suggestion
+- an explanation
+
 
 Examples that SHOULD be remembered:
 
@@ -426,6 +484,38 @@ Examples that SHOULD be remembered:
 - "I like airport lounge benefits."
 - "I like NorthStar Gold Card."
 
+
+Behavioral patterns that SHOULD also be remembered:
+
+- "I travel frequently."
+- "I often make international purchases."
+- "I mostly use my card for dining."
+- "I spend more when I travel."
+- "I usually look for cards with travel benefits."
+- "I rarely use cash and prefer card payments."
+
+
+Examples where a preference is present even with another request:
+
+User:
+"I usually travel internationally. Which card should I consider?"
+
+Remember:
+"The user frequently travels internationally."
+
+Do not remember:
+"The user wants a specific card."
+
+User:
+"I mostly use my card for dining. Suggest a suitable card."
+
+Remember:
+"The user commonly uses their card for dining."
+
+Do not remember:
+"The user wants a card recommendation."
+
+
 Examples that SHOULD NOT be remembered:
 
 - "What are the benefits of this card?"
@@ -438,35 +528,70 @@ Examples that SHOULD NOT be remembered:
 - "What do I prefer?"
 - "What do you remember about me?"
 
+
 IMPORTANT:
 
-A statement such as:
+Questions about preferences are NOT themselves preferences.
+
+Examples:
+
+"What do I prefer?"
+"What do you remember about me?"
+
+Do NOT store these as preferences.
+
+Only store the actual preference information if it is present
+in the user's message.
+
+
+PRODUCT AND CARD RULE:
+
+A preference may contain a product name.
+
+Example:
 
 "I like NorthStar Gold Card."
 
-is a preference even though it contains a card/product name.
+This is a valid preference.
 
-Only extract information actually stated or clearly implied.
+Only extract the user's stated preference.
 
-Do not invent preferences.
+Do not assume:
 
-Do not store ordinary questions as preferences.
+- ownership
+- satisfaction
+- usage
+- recommendation
 
-Do not store sensitive personal information.
+unless explicitly stated.
 
-Keep the preference concise.
 
-Write the preference as a statement about the user.
+MEMORY QUALITY RULES:
 
-If multiple preferences are expressed, combine them into one
-concise preference string.
+- Only extract information actually stated or clearly implied.
+- Do not invent preferences.
+- Do not store temporary requests as long-term preferences.
+- Do not store ordinary questions as preferences.
+- Do not store sensitive personal information.
+- Keep the preference concise.
+- Write the preference as a statement about the user.
+- If multiple preferences are expressed, combine them into one concise
+  preference string.
+
 
 If there is no preference:
 
 is_preference = false
+
 preference = ""
 
-Do not answer the user's question.
+
+If a preference exists:
+
+is_preference = true
+
+preference = "<concise statement about the user>"
+
 
 Return only:
 
@@ -495,7 +620,12 @@ Current User Message:
         {
             "history": history,
             "query": query,
-        }
+        },
+        config=trace_config
+        or _get_trace_config(
+            "",
+            "Memory Preference Detection",
+        ),
     )
 
 
@@ -546,6 +676,10 @@ def memory_node(
     preference_decision = detect_user_preference(
         query=query,
         history=history,
+        trace_config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Memory Preference Detection",
+        ),
     )
 
     _check_cancelled(state)
@@ -694,7 +828,9 @@ Determine which source, if any, is required to answer the user's question.
 
 Choose EXACTLY ONE route:
 
+==================================================
 1. VECTOR_DB
+==================================================
 
 Use when the answer requires information from the credit-card knowledge base, including:
 
@@ -703,7 +839,26 @@ Use when the answer requires information from the credit-card knowledge base, in
 - Policies, FAQs, terms & conditions
 - Product documentation or bank rules
 
+VECTOR_DB is used for general product, policy, and credit-card knowledge.
+
+A question can still be VECTOR_DB even if phrased using:
+
+- "I"
+- "my"
+- "me"
+
+when the user is asking about general product information.
+
+Examples:
+
+- "How many points do I earn for dining?" → VECTOR_DB
+- "What is the dining reward rate?" → VECTOR_DB
+- "What are the benefits of the travel card?" → VECTOR_DB
+
+
+==================================================
 2. RDBMS
+==================================================
 
 Use when the answer requires only structured data from the relational database, including:
 
@@ -713,7 +868,7 @@ Use when the answer requires only structured data from the relational database, 
 - Counts, summaries or other customer-specific data
 
 RDBMS is for actual customer-specific data, not generic questions about
-how the product or reward program works.
+how products or reward programs work.
 
 Use RDBMS when the question asks for actual or historical customer data,
 such as:
@@ -726,36 +881,56 @@ such as:
 - statements
 - customer/card details
 
+Examples:
+
+- "How much did I spend last month?" → RDBMS
+- "How many reward points do I have?" → RDBMS
+- "Show my recent transactions" → RDBMS
+
+
 A generic question about earning rates, benefits, eligibility, fees,
 rules, or policies is VECTOR_DB even if phrased using "I", "my", or "me".
 
 Examples:
 
 - "How many points do I earn for dining?" → VECTOR_DB
-- "How many points did I earn for dining last month?" → RDBMS
+- "How many points did I earn from dining last month?" → RDBMS
 - "What is the dining reward rate?" → VECTOR_DB
 
+
+==================================================
 3. HYBRID
+==================================================
 
 Use when BOTH the relational database and knowledge base are required.
 
-Examples include questions requiring customer-specific data together with:
+HYBRID requires both:
 
-- Reward rules
-- Fee or interest policies
-- Billing rules
-- Spend categorization rules
-- Other product or policy information
+1. actual customer-specific data
+2. knowledge-base information such as rules, policies, benefits,
+   fees, or product information
 
-Use HYBRID only when the answer genuinely requires BOTH:
+Use HYBRID when the answer cannot be completed using only one source.
 
-1. actual customer/transaction data
-2. knowledge-base rules or policies
+Examples:
 
-Do not use HYBRID merely because the question mentions rewards,
-spending, fees, or another topic that exists in both sources.
+- Customer spending + reward calculation rules
+- Customer usage + card benefit rules
+- Customer data + product recommendation requiring policy information
 
+Do not use HYBRID merely because a question mentions:
+
+- rewards
+- spending
+- fees
+- cards
+
+Use HYBRID only when both sources are genuinely required.
+
+
+==================================================
 4. DIRECT
+==================================================
 
 Use when no database or knowledge-base retrieval is required.
 
@@ -763,89 +938,135 @@ This includes:
 
 - Greetings
 - Simple conversation
-- Questions about the assistant's capabilities
+- Questions about assistant capabilities
 - General chit-chat
-- Personal-memory questions that can be answered entirely from
-  User Preference Memory
-- Questions such as:
-    "what do I prefer?"
-    "what do I like?"
-    "what do you remember about me?"
-    "what are my preferences?"
-    "what card do I like?"
-    "how do I prefer to travel?"
-    "what name do you call me?"
-    "do you remember my preferences?"
+- Personal-memory questions where the answer can be obtained entirely
+  from User Preference Memory
 
-IMPORTANT PERSONAL MEMORY RULE:
+
+Examples:
+
+"What do you do?"
+
+"Hello"
+
+"What do you remember about me?"
+
+"What are my preferences?"
+
+"How do I usually travel?"
+
+"What card do I like?"
+
+
+==================================================
+IMPORTANT PERSONAL MEMORY RULE
+==================================================
 
 User Preference Memory contains information retrieved from the
 authenticated user's Mem0 memory.
 
-If the current question asks about the user's:
+User Preference Memory is authoritative ONLY for stored personal
+preferences and remembered information.
+
+Use User Preference Memory when the user's primary intent is to:
+
+- retrieve stored preferences
+- confirm remembered information
+- update preferences
+- discuss likes, dislikes, habits, choices, or defaults
+
+If the question can be answered completely from available User Preference
+Memory, use DIRECT.
+
+Do NOT use retrieval routes when memory alone is sufficient.
+
+
+==================================================
+MEMORY AVAILABILITY RULE
+==================================================
+
+User Preference Memory can only be used when actual stored memory content
+is available.
+
+If User Preference Memory is empty or unavailable:
+
+- Do not assume the user has stored preferences.
+- Do not create preferences from the current question.
+- Do not answer using DIRECT based on missing memory.
+
+When memory is unavailable, classify the question based on the actual
+information required to answer it.
+
+
+==================================================
+CRITICAL MEMORY CONTEXT RULE
+==================================================
+
+User Preference Memory may also be provided as personalization context.
+
+The presence of stored preferences does NOT automatically mean the route
+is DIRECT.
+
+Always classify based on the user's requested action or intent.
+
+If the user provides personal preferences, habits, or past behavior while
+asking the assistant to perform another task, classify based on that task.
+
+Examples of other tasks include:
+
+- recommendations
+- comparisons
+- product selection
+- personalized decisions
+- explanations
+- eligibility checks
+- calculations
+
+For these cases:
+
+- Use VECTOR_DB if product knowledge is required.
+- Use RDBMS if customer-specific data is required.
+- Use HYBRID if both customer data and knowledge-base information are required.
+
+User Preference Memory should be treated as supporting context for
+personalization, not as the answer source unless the user is explicitly
+asking about stored memory.
+
+
+==================================================
+PERSONALIZED RECOMMENDATION RULE
+==================================================
+
+Recommendations, comparisons, suitability assessments, and product
+selection questions are not DIRECT questions.
+
+When the user wants the assistant to recommend, compare, select, or
+evaluate a product or option:
+
+- Do not route to DIRECT only because User Preference Memory exists.
+- Do not route to DIRECT because the user describes their habits or needs.
+- Use the route required by the information needed to make the decision.
+
+Examples:
+
+- Product knowledge only required → VECTOR_DB
+- Customer-specific information required → RDBMS
+- Customer information plus product rules/benefits required → HYBRID
+
+
+==================================================
+IMPORTANT SOURCE AUTHORITY RULE
+==================================================
+
+User Preference Memory is authoritative ONLY for:
 
 - preferences
 - likes
 - dislikes
 - habits
 - choices
-- defaults
 - remembered personal information
-
-then use User Preference Memory to answer the question.
-
-Do NOT classify these questions as unrelated merely because
-they are not directly about banking.
-
-Example:
-
-User:
-"What do I prefer?"
-
-User Preference Memory:
-- User prefers to be called Jame
-- User prefers to travel by bus rather than train
-- User likes the NorthStar Gold card and would recommend it to others
-
-Correct route:
-
-DIRECT
-
-Correct response:
-
-A concise summary of the stored preferences.
-
-Another example:
-
-User:
-"What card do I prefer?"
-
-If User Preference Memory says:
-
-- User likes the NorthStar Gold card
-
-then answer directly using that memory.
-
-Another example:
-
-User:
-"How do I prefer to travel?"
-
-If User Preference Memory says:
-
-- User prefers to travel by bus rather than train
-
-then answer directly using that memory.
-
-If no relevant stored preference exists, say that there is no stored
-preference available for that topic.
-
-Do NOT invent preferences.
-
-IMPORTANT SOURCE AUTHORITY RULE:
-
-User Preference Memory is authoritative ONLY for the user's stored
-preferences.
 
 It is NOT authoritative for:
 
@@ -858,27 +1079,41 @@ It is NOT authoritative for:
 - policies
 - eligibility
 - product rules
-- other factual banking information
+- factual banking information
 
 Those require the appropriate retrieval route.
 
-For example:
+
+Examples:
 
 "What is my balance?"
 
 → RDBMS
 
+
 "What did I spend last month?"
 
 → RDBMS
+
 
 "What benefits does my card have?"
 
 → VECTOR_DB
 
-"Based on my spending and the card rules, which card is best?"
 
-→ HYBRID when both customer data and knowledge-base rules are required.
+"What are the rules for earning reward points?"
+
+→ VECTOR_DB
+
+
+"Use my information and card rules to answer this"
+
+→ HYBRID when both sources are required.
+
+
+==================================================
+DIRECT RESPONSE RULES
+==================================================
 
 For DIRECT:
 
@@ -890,28 +1125,36 @@ For DIRECT:
   topics.
 - Do not retrieve from RDBMS or VECTOR_DB.
 
-Routing rules:
+
+==================================================
+ROUTING RULES
+==================================================
 
 - Return exactly ONE route.
-- Use HYBRID whenever both structured data and knowledge-base information
-  are required.
-- Use retrieval routes only when retrieval is necessary.
+- Determine the route based on the user's requested action, not only
+  the words present in the question or memory.
 - Use conversation history to resolve references.
 - Use User Preference Memory when the user asks about stored preferences.
-- If the question can be answered completely from User Preference Memory,
-  use DIRECT.
-- If the question requires actual customer/transaction data, use RDBMS.
-- If the question requires both customer data and knowledge-base
-  information, use HYBRID.
+- If memory alone answers the question, use DIRECT.
+- If actual customer or transaction data is required, use RDBMS.
+- If product or policy knowledge is required, use VECTOR_DB.
+- If both customer data and knowledge-base information are required,
+  use HYBRID.
+- Do not route to DIRECT only because User Preference Memory contains
+  matching information.
+- Do not route to DIRECT when memory is unavailable.
 - If unsure between a single retrieval source and HYBRID, choose HYBRID.
+
 
 For VECTOR_DB, RDBMS and HYBRID:
 
 - Set `direct_response` to an empty string.
 
+
 For DIRECT:
 
 - `direct_response` must contain the actual answer.
+
 
 Return:
 
@@ -954,7 +1197,11 @@ Do not invent information that is not present in User Preference Memory.
             "query": query,
             "history": history,
             "user_preferences": user_preferences,
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Query Router LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -1225,7 +1472,11 @@ Current User Question:
                 "messages",
                 [],
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Knowledge Strategy LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -1266,7 +1517,7 @@ def query_optimization_node(
 
     print("========= INSIDE QUERY REFORMULATION NODE =========")
 
-    llm = _get_router_llm()
+    llm = _get_llm()
 
     structured_llm = llm.with_structured_output(RetrievalQueryDecision)
 
@@ -1408,7 +1659,11 @@ Retrieval Strategy:
                 "knowledge_strategy",
                 "VECTOR",
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Query Optimization LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -1547,7 +1802,11 @@ Current User Question:
             "schema": schema_info,
             "history": history,
             "question": state["query"],
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "NL2SQL LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -2124,7 +2383,11 @@ Previous Evaluation Feedback:
                     "evaluation_feedback",
                     "",
                 ),
-            }
+            },
+            config=_get_trace_config(
+                state.get("thread_id", ""),
+                "Answer Generation LLM - Streaming",
+            ),
         ):
 
             _check_cancelled(state)
@@ -2210,7 +2473,11 @@ Populate the remaining response fields from the supplied context.
                     "",
                 ),
                 "streamed_answer": streamed_answer,
-            }
+            },
+            config=_get_trace_config(
+                state.get("thread_id", ""),
+                "Answer Metadata LLM - Streaming",
+            ),
         )
 
         _check_cancelled(state)
@@ -2251,7 +2518,11 @@ Populate the remaining response fields from the supplied context.
                 "evaluation_feedback",
                 "",
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Answer Generation LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -2441,7 +2712,11 @@ Previous Evaluation Feedback:
                 "evaluation_feedback",
                 "",
             ),
-        }
+        },
+        config=_get_trace_config(
+            state.get("thread_id", ""),
+            "Answer Evaluation LLM",
+        ),
     )
 
     _check_cancelled(state)
@@ -3066,7 +3341,16 @@ def run_search_agent(
     config = {
         "configurable": {
             "thread_id": thread_id,
-        }
+        },
+        "run_name": "NorthStar RAG Query",
+        "tags": [
+            "northstar",
+            "rag",
+            "non-streaming",
+        ],
+        "metadata": {
+            "thread_id": thread_id,
+        },
     }
 
     try:
@@ -3142,7 +3426,16 @@ async def run_search_agent_stream(
         "configurable": {
             "thread_id": thread_id,
             "streaming": True,
-        }
+        },
+        "run_name": "NorthStar RAG Query",
+        "tags": [
+            "northstar",
+            "rag",
+            "streaming",
+        ],
+        "metadata": {
+            "thread_id": thread_id,
+        },
     }
 
     final_response = None
