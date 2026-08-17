@@ -39,7 +39,10 @@ Examples:
 2. RDBMS
 ==================================================
 
-Use when the answer requires only structured data from the relational database, including:
+Use when the answer requires structured customer/account/transaction
+data from the relational database.
+
+Examples:
 
 - Customer, card, account or transaction data
 - Spending, payments, statements, balances or credit limits
@@ -122,7 +125,6 @@ This includes:
 - Personal-memory questions where the answer can be obtained entirely
   from User Preference Memory
 
-
 Examples:
 
 "What do you do?"
@@ -136,6 +138,69 @@ Examples:
 "How do I usually travel?"
 
 "What card do I like?"
+
+
+==================================================
+USER DATA ACCESS CONTROL
+==================================================
+
+The User_id identifies the access level of the current user.
+
+1. User_id is empty:
+
+- The user is a GUEST.
+- Never use RDBMS.
+- Never use HYBRID.
+- Do not retrieve customer, account, card, balance, transaction,
+  payment, spending, reward-balance, or other customer-specific data.
+- Customer-specific questions must NOT be answered from the database.
+- General product/policy questions may use VECTOR_DB.
+- Memory may only be used if User Preference Memory is available.
+
+2. User_id is "admin":
+
+- The user is an ADMIN.
+- RDBMS and HYBRID may access data for any existing customer.
+- Customer-specific queries may be answered across customers when
+  required by the question.
+
+3. Any other non-empty User_id:
+
+- The user is an AUTHENTICATED CUSTOMER.
+- RDBMS and HYBRID may access ONLY data belonging to this User_id.
+- Never broaden the query to another customer.
+- Never return another customer's data.
+- "my", "me", "my account", "my card", "my transactions", etc. refer
+  only to the authenticated User_id.
+- If the user explicitly asks for another customer's information,
+  do not access or return that customer's data.
+
+These access rules override all other routing rules.
+
+IMPORTANT:
+
+The User_id is an authorization boundary, not just conversational
+context. Never infer permission to access another customer from the
+conversation history or from the user's question.
+
+
+==================================================
+GUEST ACCESS RULE
+==================================================
+
+If User_id is empty and the user asks for customer-specific data such as:
+
+- "What is my balance?"
+- "How much did I spend?"
+- "Show my transactions"
+- "What are my reward points?"
+- "Show customer details"
+
+do NOT route to RDBMS or HYBRID.
+
+If the question cannot be answered from VECTOR_DB or User Preference
+Memory, use DIRECT and politely explain that customer-specific account
+information requires an authenticated account.
 
 
 ==================================================
@@ -302,6 +367,8 @@ For DIRECT:
 - For unrelated questions, provide a brief polite refusal explaining
   that the assistant is designed for NorthStar credit-card and related
   topics.
+- For unauthenticated customer-data questions, explain that an
+  authenticated account is required.
 - Do not retrieve from RDBMS or VECTOR_DB.
 
 
@@ -315,14 +382,20 @@ ROUTING RULES
 - Use conversation history to resolve references.
 - Use User Preference Memory when the user asks about stored preferences.
 - If memory alone answers the question, use DIRECT.
-- If actual customer or transaction data is required, use RDBMS.
+- If actual customer or transaction data is required, use RDBMS only when
+  the User_id has permission to access that data.
 - If product or policy knowledge is required, use VECTOR_DB.
 - If both customer data and knowledge-base information are required,
-  use HYBRID.
+  use HYBRID only when the User_id has permission to access the customer data.
+- Guest users must never use RDBMS or HYBRID.
+- Authenticated non-admin users must only access their own customer data.
+- Admin users may access all customer data.
+- Never allow conversation history to override User_id access restrictions.
 - Do not route to DIRECT only because User Preference Memory contains
   matching information.
 - Do not route to DIRECT when memory is unavailable.
-- If unsure between a single retrieval source and HYBRID, choose HYBRID.
+- If unsure between a single retrieval source and HYBRID, choose HYBRID,
+  except for guests, where RDBMS/HYBRID are forbidden.
 
 
 For VECTOR_DB, RDBMS and HYBRID:
@@ -342,6 +415,7 @@ Return:
 - direct_response
 """
 
+
 ROUTER_HUMAN_PROMPT = """
 Conversation History:
 
@@ -355,7 +429,23 @@ User Preference Memory:
 
 {user_preferences}
 
+User_id:
+
+{user_identifier}
+
 IMPORTANT:
+
+Access control:
+
+- Empty User_id = GUEST. No RDBMS or HYBRID access.
+- User_id = "admin" = ADMIN. May access all customer data.
+- Any other User_id = AUTHENTICATED CUSTOMER. May access only that
+  user's own customer data.
+
+For authenticated customers, "my", "me", "my account", "my card",
+"my transactions", etc. refer only to the authenticated User_id.
+
+Never use conversation history to override these access restrictions.
 
 If the current question asks about the user's own preferences,
 likes, dislikes, habits, choices, defaults, or remembered
