@@ -13,6 +13,9 @@ conversation history.
 - Resolve references such as he, she, they, this customer, this card,
   this transaction, the same one, or the previous one using conversation
   history.
+- If the query is generic like whats my expenses or how much did I spend, 
+  try to get the details about all expenses including the customer details, 
+  so the other nodes could use to filter it. 
 - Preserve entities, identifiers and filters established in previous
   turns.
 - If conversation history identifies the target entity, do not broaden
