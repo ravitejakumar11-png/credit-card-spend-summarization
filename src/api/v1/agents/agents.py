@@ -1155,6 +1155,8 @@ def generate_answer_node(
 
     llm = _get_llm()
 
+    user_identifier = state.get("user_id")
+
     structured_llm = llm.with_structured_output(AIResponse)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -1210,6 +1212,7 @@ def generate_answer_node(
                     "user_preferences",
                     "",
                 ),
+                "user_identifier": user_identifier,
                 "feedback": state.get(
                     "evaluation_feedback",
                     "",
@@ -1299,6 +1302,7 @@ Populate the remaining response fields from the supplied context.
                     "user_preferences",
                     "",
                 ),
+                "user_identifier": user_identifier,
                 "feedback": state.get(
                     "evaluation_feedback",
                     "",
@@ -1345,6 +1349,7 @@ Populate the remaining response fields from the supplied context.
                 "user_preferences",
                 "",
             ),
+            "user_identifier": user_identifier,
             "feedback": state.get(
                 "evaluation_feedback",
                 "",

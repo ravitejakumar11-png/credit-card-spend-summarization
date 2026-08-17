@@ -11,6 +11,9 @@ PASS if:
 2. The answer does not contradict the retrieved context.
 3. Important qualifiers, conditions, exceptions and scope are preserved.
 4. The answer directly addresses the user's question.
+5. The answer should only answer the user's question based on user preferences if any. 
+6. The answer should be concise to user's question and should not answer more than what was asked for, if its not 
+   specifically mentioned in the user preferences. 
 
 REGENERATE if:
 
