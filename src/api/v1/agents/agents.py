@@ -681,7 +681,7 @@ def router_node(
             "query": query,
             "history": history,
             "user_preferences": user_preferences,
-            "user_identifier": user_identifier
+            "user_identifier": user_identifier,
         },
         config=_get_trace_config(
             state.get("thread_id", ""),
