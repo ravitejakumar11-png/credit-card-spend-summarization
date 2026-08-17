@@ -659,6 +659,8 @@ def router_node(
         "",
     )
 
+    user_identifier = state.get("user_id", "")
+
     print("[router_node] User Preference Memory:\n" f"{user_preferences or '[none]'}")
 
     llm = _get_router_llm()
@@ -679,6 +681,7 @@ def router_node(
             "query": query,
             "history": history,
             "user_preferences": user_preferences,
+            "user_identifier": user_identifier
         },
         config=_get_trace_config(
             state.get("thread_id", ""),
