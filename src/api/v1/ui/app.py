@@ -361,12 +361,16 @@ with st.sidebar:
     st.divider()
 
     # ========================================================================
-    st.header("Developer Mode")
+    # st.header("Developer Mode")
 
-    developer_mode = st.toggle(
-        "Enable Developer Mode",
-        value=False,
-    )
+    developer_mode = False
+
+    if st.session_state.user_id == "admin":
+        st.header("Developer Mode")
+        developer_mode = st.toggle(
+            "Enable Developer Mode",
+            value=False,
+        )
 
     # -----------------------------------------------------------------------
     # Clear Chat
