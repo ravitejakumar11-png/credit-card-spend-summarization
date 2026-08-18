@@ -145,8 +145,18 @@ FTS performs lexical matching.
 Use FTS when the user likely expects exact terminology,
 names, phrases, identifiers, or direct references.
 
-Do not choose FTS only because the question contains
-common words like "credit", "card", "reward", or "payment".
+Do not choose FTS only because of generic words.
+However, treat complete banking feature names,
+fees, benefits, policies, and product terms as exact entities.
+
+Classification priority:
+
+1. If query is an exact banking term, feature, fee, benefit,
+   policy, or product phrase -> FTS
+
+2. If query asks for explanation of that term -> VECTOR_FTS
+
+3. If query is conceptual without specific terminology -> VECTOR
 
 Rules:
 
